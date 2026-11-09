@@ -1266,12 +1266,12 @@ bool FATDCursedBoonTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Eight cursed boons, +115% together"), AllCursed, 2.15f, 0.0001f);
 
 	// Blood Tide: one more life per leak, after the Abyss 2 doubling
-	FTDRunRules Blood;
-	Blood.Boons = Bit(ETDBoon::BloodTide);
+	FTDRunRules BloodTide;
+	BloodTide.Boons = Bit(ETDBoon::BloodTide);
 	TestEqual(TEXT("A crab leak costs 1 normally"), Fresh.LeakLives(1), 1);
-	TestEqual(TEXT("Blood Tide: a crab leak costs 2"), Blood.LeakLives(1), 2);
-	Blood.Tier = 2;
-	TestEqual(TEXT("Blood Tide at Abyss 2: a turtle leak costs 2 x 2 + 1"), Blood.LeakLives(2), 5);
+	TestEqual(TEXT("Blood Tide: a crab leak costs 2"), BloodTide.LeakLives(1), 2);
+	BloodTide.Tier = 2;
+	TestEqual(TEXT("Blood Tide at Abyss 2: a turtle leak costs 2 x 2 + 1"), BloodTide.LeakLives(2), 5);
 
 	// Gilded Shackles: half the refund, a quarter with Abyss 5; the build-phase full refund stays
 	const int32 Plain = TD::SellValue(40, 1, 0.0f, 0, 40, false);

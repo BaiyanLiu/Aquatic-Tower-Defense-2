@@ -380,8 +380,8 @@ void ATDPlayerController::UpdateRangeIndicators(ATDGameMode* GameMode, ATDGrid* 
 		Views.Add(Main);
 	}
 
-	// every tower's range while Alt is held or the setting is on
-	const bool bShowAll = !IsMenuOpen() && (GameMode->IsShowingAllRanges() || IsAltHeld());
+	// every tower's range while the Info key (Alt) is held
+	const bool bShowAll = !IsMenuOpen() && IsAltHeld();
 	if (bShowAll)
 	{
 		for (const ATDTower* Tower : Grid->GetTowers())

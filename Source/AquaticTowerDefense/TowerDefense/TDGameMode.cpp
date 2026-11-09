@@ -33,7 +33,7 @@
 
 namespace
 {
-	constexpr float GroupGap = 1.6f;
+	constexpr float SpawnGroupGap = 1.6f;
 }
 
 ATDGameMode::ATDGameMode()
@@ -255,7 +255,7 @@ void ATDGameMode::BuildWave(int32 N, TArray<FPendingSpawn>& OutSpawns)
 		{
 			OutSpawns.Add({ Type, Start + i * Gap * Spread, 0, HealthScale });
 		}
-		T += (Count - 1) * Gap + GroupGap;
+		T += (Count - 1) * Gap + SpawnGroupGap;
 		++GroupIndex;
 	};
 
@@ -290,7 +290,7 @@ void ATDGameMode::BuildWave(int32 N, TArray<FPendingSpawn>& OutSpawns)
 			Last = FMath::Max(Last, Spawn.Time);
 		}
 		OutSpawns.StableSort([](const FPendingSpawn& A, const FPendingSpawn& B) { return A.Time < B.Time; });
-		OutSpawns.Add({ ETDEnemyType::Kraken, Last + 3.0f * GroupGap, TDMod::Titan });
+		OutSpawns.Add({ ETDEnemyType::Kraken, Last + 3.0f * SpawnGroupGap, TDMod::Titan });
 		return;
 	}
 
@@ -343,7 +343,7 @@ void ATDGameMode::BuildWave(int32 N, TArray<FPendingSpawn>& OutSpawns)
 	{
 		const ETDEnemyType Elites[] = { ETDEnemyType::Turtle, ETDEnemyType::Cuttlefish, ETDEnemyType::ShockEel, ETDEnemyType::SeaStar };
 		const float Last = OutSpawns.Num() > 0 ? OutSpawns.Last().Time : 0.0f;
-		OutSpawns.Add({ Elites[(N / 5) % UE_ARRAY_COUNT(Elites)], Last + GroupGap, TDMod::Elite });
+		OutSpawns.Add({ Elites[(N / 5) % UE_ARRAY_COUNT(Elites)], Last + SpawnGroupGap, TDMod::Elite });
 	}
 }
 

@@ -287,8 +287,6 @@ public:
 
 	bool IsShowingFps() const { return bShowFps; }
 	void SetShowFps(bool bShow) { bShowFps = bShow; }
-	bool IsShowingAllRanges() const { return bShowAllRanges; }
-	void SetShowAllRanges(bool bShow) { bShowAllRanges = bShow; }
 	bool IsVSyncEnabled() const { return bVSync; }
 	void SetVSync(bool bEnabled);
 	void SaveSettings();
@@ -544,7 +542,6 @@ protected:
 	TArray<FKey> KeyBindings;
 	int32 BindingsVersion = 0;
 	int32 Rebinding = -1;
-	bool bShowAllRanges = false;
 	int32 AutoSalvage = 0;
 
 	// run summary (reset on a new game, saved with the game)

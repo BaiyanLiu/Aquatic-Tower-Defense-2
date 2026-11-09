@@ -257,7 +257,7 @@ void ATDHUD::DrawMenu(ATDGameMode* GameMode)
 	case ETDMenu::Main:		ContentH = 76.0f + 406.0f + 62.0f + 40.0f + 26.0f * TD::MapCount; break;	// 76: the logo above the title; 62: the Mastery button
 	case ETDMenu::Pause:	ContentH = 520.0f + 44.0f - 26.0f + 30.0f; break;	// +44: the brand above "PAUSED"; -26: no resume hint under it; +30: the score line
 	case ETDMenu::Settings:	ContentH = 764.0f; break;	// (auto-salvage moved to the storage panel, the all-ranges switch and the Alt note are gone)
-	case ETDMenu::Controls:	ContentH = 30.0f + 96.0f + 30.0f + 50.0f * FMath::Max(TDBind::ActionCount + 1, (int32)ETDTowerType::Count) + 6.0f + 30.0f + 50.0f + 30.0f; break;	// two columns: actions and Info, tower keys
+	case ETDMenu::Controls:	ContentH = 30.0f + 96.0f + 30.0f + 50.0f * FMath::Max(TDBind::ActionCount + 3, (int32)ETDTowerType::Count) + 20.0f + 50.0f + 30.0f; break;	// two columns: actions, Info and the fixed mouse rows; tower keys
 	case ETDMenu::Victory:	ContentH = 30.0f + 196.0f + RunSummaryHeight + 4.0f * 62.0f + 18.0f; break;
 	default: break;
 	}
@@ -557,16 +557,30 @@ void ATDHUD::DrawMenu(ATDGameMode* GameMode)
 			BindRow(i, TDBind::ActionName((ETDBind)i), Left, RowsY + RowStep * LeftRows++);
 		}
 		BindRow((int32)ETDBind::Info, TDBind::ActionName(ETDBind::Info), Left, RowsY + RowStep * LeftRows++);
+		// the mouse buttons can't be changed: same row and key box, greyed out like a disabled button, with no click or hover
+		auto FixedRow = [&](const FString& Label, const FString& Key, float ColX, float RowY)
+		{
+			const float KeyX = ColX + ColW - KeyW;
+			const float R = RadiusButton * S;
+			const FBox2D Rect(FVector2D(KeyX, RowY), FVector2D(ColX + ColW, RowY + RowH));
+			Text(Label, ColX, RowY + RowH * 0.5f, DimText, FitSize(Label, 18.0f, KeyX - ColX - 10.0f * S), false, true);
+			RoundFill(Rect, DisabledButton, R);
+			RoundFill(FBox2D(Rect.Min, FVector2D(Rect.Max.X, Rect.Min.Y + Rect.GetSize().Y * 0.5f)), FLinearColor(1.0f, 1.0f, 1.0f, 0.07f), R);
+			RoundFill(FBox2D(FVector2D(Rect.Min.X, Rect.Max.Y - FMath::Max(2.0f, 3.0f * S)), Rect.Max), FLinearColor(0.0f, 0.0f, 0.0f, 0.22f), FMath::Min(R, 3.0f * S));
+			RoundFrame(Rect, DisabledEdge, R, 1.0f * S);
+			Text(Key, Rect.GetCenter().X, Rect.GetCenter().Y, DisabledText, FitSize(Key, 18.0f, Rect.GetSize().X - 14.0f * S), true, true);
+			if (Rect.IsInside(MousePos))
+			{
+				SetTip({ { TEXT("This key can't be changed"), DimText } });
+			}
+		};
+		FixedRow(TEXT("Build / select"), TEXT("Click"), Left, RowsY + RowStep * LeftRows++);
+		FixedRow(TEXT("Cancel"), TEXT("Right-click"), Left, RowsY + RowStep * LeftRows++);
 		for (int32 i = 0; i < (int32)ETDTowerType::Count; ++i)
 		{
 			BindRow((int32)TDBind::TowerBind((ETDTowerType)i), TD::Tower((ETDTowerType)i).Name, Left + ColW + ColGap, RowsY + RowStep * i);
 		}
-		Y = RowsY + RowStep * FMath::Max(LeftRows, (int32)ETDTowerType::Count) + 6.0f * S;
-
-		// the fixed controls, for reference
-		const FString Fixed = TEXT("Click: build   Right-click: cancel");
-		Text(Fixed, Left, Y, DimText, FitSize(Fixed, SizeSmall, Right - Left));
-		Y += 30.0f * S;
+		Y = RowsY + RowStep * FMath::Max(LeftRows, (int32)ETDTowerType::Count) + 12.0f * S;
 
 		const float Half = (Right - Left - 12.0f * S) * 0.5f;
 		Button(FBox2D(FVector2D(Left, Y), FVector2D(Left + Half, Y + BtnH)), TEXT("Reset to defaults"), EButton::ResetKeys, 0, ButtonColor, true, false, 18.0f);

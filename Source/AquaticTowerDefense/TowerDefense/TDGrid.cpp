@@ -17,7 +17,7 @@
 namespace
 {
 	constexpr int32 RingSegments = 72;
-	constexpr float RingWidth = 8.0f;		// uu (was 15; the user found the range border too thick)
+	constexpr float RangeRingWidth = 8.0f;		// uu (was 15; the user found the range border too thick)
 	constexpr float RingHeight = 4.0f;
 	constexpr float RingZ = 7.0f;
 	constexpr float DiscZ = 3.0f;
@@ -1000,7 +1000,7 @@ void ATDGrid::SetRangeViews(const TArray<FTDRangeView>& Views)
 				const float Angle = 2.0f * PI * Seg / RingSegments;
 				const FVector Pos(Center.X + FMath::Cos(Angle) * Radius, Center.Y + FMath::Sin(Angle) * Radius, RingZ);
 				Segments.Add(FTransform(FRotator(0.0f, FMath::RadiansToDegrees(Angle) + 90.0f, 0.0f), Pos,
-					FVector(SegmentLength, RingWidth, RingHeight) / 100.0f));
+					FVector(SegmentLength, RangeRingWidth, RingHeight) / 100.0f));
 			}
 			Ind.Ring->ClearInstances();
 			Ind.Ring->AddInstances(Segments, false, false, false);

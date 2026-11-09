@@ -710,13 +710,13 @@ void FTDUITest::BuildScript()
 	Check(TEXT("harpoon became a Swordfish"), [TowerAt]() { return TowerAt(FIntPoint(11, 4))->GetForm() == 1 && !TowerAt(FIntPoint(11, 4))->CanChooseForm(); });
 	Do(TEXT("click Stats tab"), [Click]() { Click(EB::Tab, 0); });
 	Check(TEXT("stats tab shown"), [P]() { return P()->GetPanelTab() == 0; });
-	Do(TEXT("add a jellyfish, deselect, show all ranges"), [G, WeakPC]()
+	Do(TEXT("add a jellyfish, deselect, hold Alt"), [G, WeakPC]()
 	{
 		G()->TryPlaceTower(FIntPoint(13, 9), ETDTowerType::Jelly, true);
 		WeakPC->ClearSelection();
-		G()->SetShowAllRanges(true);
+		WeakPC->ATDHoldAlt(1);
 	});
-	Check(TEXT("show all ranges draws every tower's range"), [Grid]()
+	Check(TEXT("holding Alt draws every tower's range"), [Grid]()
 	{
 		int32 Ranged = 0;
 		for (const ATDTower* T : Grid()->GetTowers())
@@ -725,12 +725,11 @@ void FTDUITest::BuildScript()
 		}
 		return Ranged >= 2 && Grid()->GetVisibleRangeCount() == Ranged;
 	});
-	Do(TEXT("turn show all off, reselect the harpoon"), [G, ClickCell]() { G()->SetShowAllRanges(false); ClickCell(FIntPoint(11, 4)); });
+	Do(TEXT("let go of Alt, reselect the harpoon"), [P, ClickCell]() { P()->ATDHoldAlt(0); ClickCell(FIntPoint(11, 4)); });
 
 	// ---------------- hotkeys on aura towers (they have skills and items like the attackers) ----------------
-	Do(TEXT("turn show all off, place a Humpback and an Acid Vent"), [G]()
+	Do(TEXT("place a Humpback and an Acid Vent"), [G]()
 	{
-		G()->SetShowAllRanges(false);
 		G()->TryPlaceTower(FIntPoint(14, 12), ETDTowerType::Humpback, true);
 		G()->TryPlaceTower(FIntPoint(15, 12), ETDTowerType::AcidVent, true);
 	});
