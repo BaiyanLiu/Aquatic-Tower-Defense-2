@@ -247,9 +247,11 @@ namespace TD
 	/** Uniques among these items (old saves had no record of found uniques) */
 	uint32 InferUniquesFound(const TArray<FTDItem>& Items);
 
-	/** A Legendary drop has this chance to be a unique instead; Kraken bosses have this extra chance of one; the Abyssal Kraken always brings one */
-	constexpr float UniqueFromLegendaryChance = 0.25f;
-	constexpr float UniqueBossChance = 0.15f;
+	/** A Legendary drop has this chance to be a unique instead; Kraken bosses have this extra chance of one; the Abyssal Kraken always brings one.
+	 *  Lowered 2026-11-12 (were 25% and 15%, which found all nine well before wave 100) so a typical Normal run finds about 3 by the end of
+	 *  wave 100: about 0.8 from Legendary drops, 1.2 from the 49 Krakens' rolls and 1 from the Abyssal Kraken */
+	constexpr float UniqueFromLegendaryChance = 0.06f;
+	constexpr float UniqueBossChance = 0.025f;
 	/** All creature item drop chances (regular, elite, boss) are scaled by this; halved 2026-11-08 at the user's request */
 	constexpr float DropRateScale = 0.5f;
 	/** Badge colour that marks an item's slot (Shell, Pearl, Charm) in item tiles */

@@ -1080,7 +1080,8 @@ void ATDHUD::Button(const FBox2D& Rect, const FString& Label, EButton Id, int32 
 	RoundFill(FBox2D(Rect.Min, FVector2D(Rect.Max.X, Rect.Min.Y + Rect.GetSize().Y * 0.5f)), FLinearColor(1.0f, 1.0f, 1.0f, IsLightFill(Base) ? 0.16f : 0.07f), R);
 	// a darker lip along the bottom gives the button some depth
 	RoundFill(FBox2D(FVector2D(Rect.Min.X, Rect.Max.Y - FMath::Max(2.0f, 3.0f * S)), Rect.Max), FLinearColor(0.0f, 0.0f, 0.0f, 0.22f), FMath::Min(R, 3.0f * S));
-	const FLinearColor Edge = !bEnabled ? DisabledEdge : (bHighlighted ? AccentColor : (bHovered ? WithAlpha(ButtonEdge, 0.5f) : ButtonEdge));
+	// a clickable button drawn in the disabled colour (an option that is off, like Auto-salvage) gets the disabled edge too
+	const FLinearColor Edge = (!bEnabled || (Base == DisabledButton && !bHovered)) ? DisabledEdge : (bHighlighted ? AccentColor : (bHovered ? WithAlpha(ButtonEdge, 0.5f) : ButtonEdge));
 	RoundFrame(Rect, Edge, R, (bHighlighted ? 1.5f : 1.0f) * S);
 
 	const FVector2D Center = Rect.GetCenter();
@@ -1149,21 +1150,63 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 		return;
 	}
 
-	// rarity-tinted well that glows on hover
-	const FLinearColor Color = TD::RarityColor(Item->Rarity);
-	if (bHovered)
+	const bool bUnique = TD::IsUnique(*Item);
+	TArray<FCanvasUVTri, TInlineAllocator<24>> Tris;	// unique corner jewels, drawn over the icon
+	if (bUnique)
 	{
-		Glow(Rect, WithAlpha(Color, 0.45f), R, 8.0f * UIScale);
+		// uniques get their own border, unlike any rarity's: a slowly breathing pale-gold halo, a thick gold rim with a thin
+		// bright inner rim (a double frame), and a small jewel on each corner
+		const float S = UIScale;
+		const float Pulse = 0.5f + 0.5f * FMath::Sin((float)Now() * 2.4f);
+		Glow(Rect, WithAlpha(UniqueColor, (bHovered ? 0.55f : 0.28f) + 0.14f * Pulse), R, (bHovered ? 8.0f : 5.0f) * S);
+		RoundFill(Rect, InsetColor, R);
+		RoundFill(Rect.ExpandBy(-1.0f * S), WithAlpha(UniqueColor * (bHovered ? 0.42f : 0.26f), 0.88f), R);
+		const FBox2D Outer = Rect.ExpandBy(0.5f * S);
+		RoundFrame(Outer, UniqueColor, R + 0.5f * S, 1.5f * S);
+		RoundFrame(Rect.ExpandBy(-2.0f * S), WithAlpha(FMath::Lerp(UniqueColor, FLinearColor::White, 0.6f), 0.55f + 0.3f * Pulse), FMath::Max(1.0f, R - 2.0f * S), 1.0f);
+
+		const float Inset = (R + 0.5f * S) * 0.3f;
+		const float H = FMath::Max(2.5f, 3.0f * S);
+		const FLinearColor Dark(0.03f, 0.04f, 0.06f, 0.95f);
+		const FLinearColor Shine = FMath::Lerp(UniqueColor, FLinearColor::White, 0.75f);
+		const FVector2D Corners[4] = { Outer.Min + FVector2D(Inset, Inset), FVector2D(Outer.Max.X - Inset, Outer.Min.Y + Inset),
+			Outer.Max - FVector2D(Inset, Inset), FVector2D(Outer.Min.X + Inset, Outer.Max.Y - Inset) };
+		auto Gem = [&Tris](const FVector2D& C, float Half, const FLinearColor& Color)
+		{
+			const FVector2D P[4] = { C + FVector2D(0, -Half), C + FVector2D(Half, 0), C + FVector2D(0, Half), C + FVector2D(-Half, 0) };
+			for (int32 i = 0; i < 2; ++i)
+			{
+				FCanvasUVTri& Tri = Tris.AddDefaulted_GetRef();
+				Tri.V0_Pos = P[0]; Tri.V1_Pos = P[i + 1]; Tri.V2_Pos = P[i + 2];
+				Tri.V0_Color = Tri.V1_Color = Tri.V2_Color = Color;
+			}
+		};
+		for (const FVector2D& C : Corners)
+		{
+			Gem(C, H + 1.0f, Dark);
+			Gem(C, H, UniqueColor);
+			Gem(C, H * 0.45f, Shine);
+		}
 	}
-	RoundFill(Rect, InsetColor, R);
-	RoundFill(Rect.ExpandBy(-1.0f * UIScale), WithAlpha(Color * (bHovered ? 0.5f : 0.3f), 0.85f), R);
-	RoundFrame(Rect, WithAlpha(Color, bHovered ? 1.0f : 0.8f), R, 1.5f * UIScale);
-	if (TD::IsUnique(*Item))
+	else
 	{
-		// uniques: a bright gold-orange double rim
-		RoundFrame(Rect.ExpandBy(1.5f * UIScale), UniqueColor, R + 1.5f * UIScale, 2.0f * UIScale);
+		// rarity-tinted well that glows on hover
+		const FLinearColor Color = TD::RarityColor(Item->Rarity);
+		if (bHovered)
+		{
+			Glow(Rect, WithAlpha(Color, 0.45f), R, 8.0f * UIScale);
+		}
+		RoundFill(Rect, InsetColor, R);
+		RoundFill(Rect.ExpandBy(-1.0f * UIScale), WithAlpha(Color * (bHovered ? 0.5f : 0.3f), 0.85f), R);
+		RoundFrame(Rect, WithAlpha(Color, bHovered ? 1.0f : 0.8f), R, 1.5f * UIScale);
 	}
 	Icon(TDIcons::ForItem(*Item), Rect.ExpandBy(-5.0f * UIScale));
+	if (Tris.Num() > 0 && Canvas)
+	{
+		FCanvasTriangleItem Gems(TArray<FCanvasUVTri>(Tris), GWhiteTexture);
+		Gems.BlendMode = SE_BLEND_Translucent;
+		Canvas->DrawItem(Gems);
+	}
 
 	// slot badge in the bottom left corner: a coloured shape per slot (Shell cyan circle, Pearl pink diamond, Charm lime triangle),
 	// ringed in dark so it stands off the icon; shape and colour both differ, so it reads without relying on colour alone

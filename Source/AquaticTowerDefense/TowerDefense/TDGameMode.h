@@ -400,9 +400,10 @@ public:
 	/** Locks or unlocks a stored item (locked items can't be salvaged and aren't moved by Sort) */
 	bool ToggleItemLock(int32 StorageIndex);
 
-	/** Auto-salvage of drops: 0 = off, 1 = Common, 2 = Common and Rare */
+	/** Auto-salvage of drops: 0 = off, 1 = Common, 2 = up to Rare, 3 = up to Epic (Legendary and uniques are never auto-salvaged).
+	 *  Per run: every new game starts off, saves keep it. */
 	int32 GetAutoSalvage() const { return AutoSalvage; }
-	void CycleAutoSalvage() { AutoSalvage = (AutoSalvage + 1) % 3; SaveSettings(); }
+	void CycleAutoSalvage() { AutoSalvage = (AutoSalvage + 1) % 4; }
 	static const TCHAR* AutoSalvageName(int32 Level);
 
 	/** Collects a dropped item near a world point (when clicked). Returns true if there was one. */

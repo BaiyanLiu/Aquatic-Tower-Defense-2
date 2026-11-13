@@ -955,12 +955,7 @@ void ATDHUD::DrawStorage(ATDGameMode* GameMode, ATDPlayerController* PC)
 	// header: title, count and a thin capacity bar
 	const float TitleW = Text(TEXT("Storage"), X + Pad, Y + Pad + 16.0f * S, AccentColor, SizeHeading, false, true).X;
 	const int32 Capacity = GameMode->GetStorageCapacity();	// fewer slots with Hungry Deep (cursed boon)
-	const float CountW = Text(FString::Printf(TEXT("%d / %d"), Storage.Num(), Capacity), X + Pad + TitleW + 10.0f * S, Y + Pad + 17.0f * S, Storage.Num() > Capacity ? LifeColor : DimText, SizeSmall, false, true).X;
-	// unique legendaries found this run
-	{
-		const FString UniqueText = FString::Printf(TEXT("Uniques %d/%d"), TD::CountUniques(GameMode->GetUniquesFound()), TD::UniqueCount);
-		Text(UniqueText, X + Pad + TitleW + 10.0f * S + CountW + 14.0f * S, Y + Pad + 17.0f * S, TD::CountUniques(GameMode->GetUniquesFound()) > 0 ? UniqueColor : DimText, SizeSmall, false, true);
-	}
+	Text(FString::Printf(TEXT("%d / %d"), Storage.Num(), Capacity), X + Pad + TitleW + 10.0f * S, Y + Pad + 17.0f * S, Storage.Num() > Capacity ? LifeColor : DimText, SizeSmall, false, true);
 	{
 		const FBox2D Track(FVector2D(X + Pad, Y + Pad + 40.0f * S), FVector2D(X + Pad + GridW, Y + Pad + 44.0f * S));
 		const float Used = FMath::Clamp((float)Storage.Num() / FMath::Max(1, Capacity), 0.0f, 1.0f);
@@ -1041,11 +1036,32 @@ void ATDHUD::DrawStorage(ATDGameMode* GameMode, ATDPlayerController* PC)
 		Button(LockRect, (Item && Item->bLocked) ? TEXT("Unlock item") : TEXT("Lock item"), EButton::ItemLock, 0, ButtonColor, Item != nullptr, false, SizeSmall);
 		const FBox2D AutoRect(FVector2D(GX + BW + BGap, BY3), FVector2D(GX + GridW, BY3 + BH));
 		const int32 Auto = GameMode->GetAutoSalvage();
-		Button(AutoRect, FString::Printf(TEXT("Auto-salvage: %s"), Auto == 2 ? TEXT("Common, Rare") : ATDGameMode::AutoSalvageName(Auto)), EButton::CycleAutoSalvage, 0, ButtonColor, true, Auto > 0, SizeSmall);
+		// off looks disabled (dark button, dim label) but stays clickable so it can be turned on
+		Button(AutoRect, FString(), EButton::CycleAutoSalvage, 0, Auto > 0 ? ButtonColor : DisabledButton, true, Auto > 0, SizeSmall);
+		{
+			// label plus one dot per rarity being salvaged (Common, Rare, Epic), in the rarity colour; no dots when off
+			const FString AutoLabel = TEXT("Auto-salvage");
+			const float Dot = 10.0f * S, DotGap = 5.0f * S, LabelGap = 8.0f * S;
+			const int32 DotCount = FMath::Clamp(Auto, 0, 3);
+			const float MaxDotsW = Dot * 3.0f + DotGap * 2.0f;	// the label keeps one size whatever the setting
+			const float DotsW = DotCount > 0 ? LabelGap + Dot * DotCount + DotGap * (DotCount - 1) : 0.0f;
+			const float LabelSize = FitSize(AutoLabel, SizeSmall, AutoRect.GetSize().X - 14.0f * S - MaxDotsW - LabelGap);
+			const float LabelW = MeasureText(AutoLabel, LabelSize).X;
+			const FVector2D C = AutoRect.GetCenter();
+			const float Left = C.X - (LabelW + DotsW) * 0.5f;
+			Text(AutoLabel, Left, C.Y, Auto > 0 ? FLinearColor::White : DisabledText, LabelSize, false, true);
+			for (int32 r = 0; r < DotCount; ++r)
+			{
+				const float DX = Left + LabelW + LabelGap + r * (Dot + DotGap);
+				const FBox2D DotRect(FVector2D(DX, C.Y - Dot * 0.5f), FVector2D(DX + Dot, C.Y + Dot * 0.5f));
+				RoundFill(DotRect.ExpandBy(1.0f * S), FLinearColor(0.0f, 0.0f, 0.0f, 0.5f), Dot * 0.5f + 1.0f * S);
+				RoundFill(DotRect, Lighten(TD::RarityColor((ETDRarity)r), 0.2f), Dot * 0.5f);
+			}
+		}
 		if (AutoRect.IsInside(MousePos))
 		{
 			SetTip({ { TEXT("Auto-salvage drops"), AccentColor }, { TEXT("Drops of the chosen rarities turn straight into pearls instead of going to storage"), FLinearColor::White },
-				{ TEXT("Click to cycle: Off, Common, Common and Rare"), DimText } });
+				{ TEXT("Click to cycle: Off, Common, up to Rare, up to Epic"), DimText } });
 		}
 		if (Item && LockRect.IsInside(MousePos))
 		{

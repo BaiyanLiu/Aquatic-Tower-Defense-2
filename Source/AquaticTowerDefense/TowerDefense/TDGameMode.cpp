@@ -1105,6 +1105,7 @@ void ATDGameMode::ResetForRun(const FTDRunRules& Rules, bool bBoons)
 
 	Pearls = TD::StartPearls;
 	Income = FTDIncome();
+	AutoSalvage = 0;	// salvage rules are per run: every new game starts with the defaults (a loaded save restores its own)
 	Lives = TD::Run().StartLives();
 	Wave = 0;
 	BuildPhaseId = 0;
@@ -2269,7 +2270,7 @@ void ATDGameMode::LoadSettings()
 		// (the saved all-ranges switch is ignored: the setting was removed, ranges show for the selection and while Alt is held)
 		SfxVolume = FMath::Clamp(Loaded->SfxVolume, 0.0f, 100.0f);
 		MusicVolume = FMath::Clamp(Loaded->MusicVolume, 0.0f, 100.0f);
-		AutoSalvage = FMath::Clamp(Loaded->AutoSalvage, 0, 2);
+		// (the saved auto-salvage setting is ignored: it is per run now, kept in the run save)
 		BestWave = Loaded->BestWave;
 		BestWinLives = Loaded->BestWinLives;
 		BestAbyss = Loaded->BestAbyss;
@@ -2366,7 +2367,7 @@ void ATDGameMode::SaveSettings()
 		Save->bSharpAA = bSharpAA;
 		Save->SfxVolume = SfxVolume;
 		Save->MusicVolume = MusicVolume;
-		Save->AutoSalvage = AutoSalvage;
+		Save->AutoSalvage = 0;	// kept in the save format only so old settings files still load
 		Save->BestWave = BestWave;
 		Save->BestWinLives = BestWinLives;
 		Save->BestAbyss = BestAbyss;
@@ -2453,6 +2454,7 @@ bool ATDGameMode::SaveGame(bool bQuiet)
 	Save->Boons = (int32)TD::Run().Boons;
 	Save->BoonOffer = BoonOffer;
 	Save->bNoBoons = !bBoonsEnabled;
+	Save->AutoSalvage = AutoSalvage;
 	Save->RunId = RunId;
 	Save->UniquesFound = (int32)UniquesFound;
 	for (const FTDItem& Item : Storage)
@@ -2558,6 +2560,7 @@ bool ATDGameMode::LoadGame(int32 Slot)
 	WavesCleared = FMath::Max(Save->WavesCleared, Wave);
 	RecordAtStart = Save->RecordAtStart >= 0 ? FMath::Min(Save->RecordAtStart, GetBestWave(TD::GetMap())) : GetBestWave(TD::GetMap());
 	bRunCheated = Save->bRunCheated;
+	AutoSalvage = FMath::Clamp(Save->AutoSalvage, 0, 3);
 	if (Save->Income.Num() == 7)
 	{
 		const TArray<int32>& In = Save->Income;
@@ -2793,6 +2796,7 @@ const TCHAR* ATDGameMode::AutoSalvageName(int32 Level)
 	{
 	case 1:		return TEXT("Common");
 	case 2:		return TEXT("Common and Rare");
+	case 3:		return TEXT("Common, Rare and Epic");
 	default:	return TEXT("Off");
 	}
 }

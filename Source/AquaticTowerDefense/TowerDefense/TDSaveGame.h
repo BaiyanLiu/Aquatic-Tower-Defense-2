@@ -196,6 +196,10 @@ public:
 	UPROPERTY()
 	bool bNoBoons = false;
 
+	/** Auto-salvage of drops for this run: 0 = off, 1 = Common, 2 = up to Rare, 3 = up to Epic (older saves load as off) */
+	UPROPERTY()
+	int32 AutoSalvage = 0;
+
 	/** Identifies the run across its saves (0 in older saves), so Retry knows whether a slot holds this run */
 	UPROPERTY()
 	int32 RunId = 0;
@@ -262,7 +266,8 @@ public:
 	UPROPERTY()
 	TArray<int32> TowerKills;
 
-	/** Drops salvaged for pearls as they fall: 0 = off, 1 = Common, 2 = Common and Rare */
+	/** No longer used: auto-salvage is now per run (in the run save) and starts off in every new game.
+	 *  Kept only so old settings files still load. */
 	UPROPERTY()
 	int32 AutoSalvage = 0;
 

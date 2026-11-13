@@ -58,7 +58,7 @@ namespace TDHUDStyle
 	inline const FLinearColor InfoText = SRGB(169, 218, 255);
 	inline const FLinearColor ErrorText = SRGB(255, 107, 107);
 	inline const FLinearColor DarkText = SRGB(42, 23, 0);
-	inline const FLinearColor UniqueColor = SRGB(255, 176, 64);	// unique legendaries' rim, tag and name
+	inline const FLinearColor UniqueColor = SRGB(255, 226, 125);	// unique legendaries' border, tag and name: a pale gold kept apart from Legendary orange
 
 	/**
 	 *  One color per kind of tower / item stat, used everywhere that stat is shown (tower cards, item tooltips,
