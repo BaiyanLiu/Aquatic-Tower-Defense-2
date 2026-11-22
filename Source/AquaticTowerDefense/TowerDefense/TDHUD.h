@@ -87,6 +87,8 @@ public:
 		ToggleShowFps,
 		ToggleVSync,
 		ToggleAA,
+		ToggleHDIcons,
+		ToggleHDInterface,
 
 		MenuControls,
 		BindKey,
@@ -239,6 +241,18 @@ protected:
 	/** Slowly animated sea behind the full-screen menus: light shafts, swaying kelp, passing fish and rising bubbles */
 	void DrawSeaBackdrop(float Strength);
 
+	/** The detailed look's backdrop (atd.DetailedUI): layered light shafts, reef ridges, shaded kelp, fish with pale bellies, painted bubbles and marine snow */
+	void DrawSeaBackdropDetailed(float Strength);
+
+	/** atd.DetailedUI is on */
+	static bool IsDetailedUI();
+
+	/** Detailed look: a painted map preview (sand cells, boulders, the trench and the reef), cached per map */
+	UTexture2D* MapThumbnailTexture(int32 Map);
+
+	/** Detailed look: a glass bar for the world overlays, Fraction full of Color, with quarter ticks when bTicks */
+	void GlassBar(const FBox2D& Rect, float Fraction, const FLinearColor& Color, bool bTicks);
+
 	/** Tiled gentle wave between X0 and X1 (a thin line, or filled above the curve), Phase in wavelengths */
 	void WaveStrip(float X0, float X1, float Y, float Height, bool bFilled, const FLinearColor& Color, float Phase);
 
@@ -296,6 +310,14 @@ protected:
 	void RoundFrame(const FBox2D& Rect, const FLinearColor& Color, float Radius, float Thickness);
 	/** Soft glow or drop shadow around a rounded rectangle, fading out over Spread pixels */
 	void Glow(const FBox2D& Rect, const FLinearColor& Color, float Radius, float Spread);
+	/** Detailed look: a nacre rim Width pixels wide, tinted toward Edge, lit from the upper left with dark keylines */
+	void NacreRim(const FBox2D& Rect, const FLinearColor& Edge, float Radius, float Width, float Alpha = 1.0f);
+	/** Detailed look for small cards and pills: the glass lip and a thin nacre rim */
+	void DetailedCardEdge(const FBox2D& Rect, const FLinearColor& Edge, float Radius, float Alpha);
+	/** Detailed look: the glass's inner lip, light along the top left and shadowed along the bottom right, fading inward over Width */
+	void InnerLip(const FBox2D& Rect, float Radius, float Width, float Strength);
+	/** Detailed look: a lit pearl (or, tinted, a bead) of the given radius */
+	void Pearl(const FVector2D& Center, float Radius, const FLinearColor& Tint = FLinearColor::White);
 	/** Draws a shape texture as a nine-slice: corners keep their shape, edges and centre stretch */
 	void NineSlice(UTexture2D* Texture, const FBox2D& Rect, float Corner, const FLinearColor& Color);
 
@@ -354,6 +376,8 @@ protected:
 
 	/** Floating top clusters drawn this frame, so the next-wave card can sit between them */
 	FBox2D TopLeftRect = FBox2D(ForceInit);
+	/** Bottom of the fast / shielded odds pill under the next-wave card this frame (0 when not drawn): toasts sit below it */
+	float PreviewPillBottom = 0.0f;
 	FBox2D TopRightRect = FBox2D(ForceInit);
 
 	/** UI scale relative to a 1080p viewport */

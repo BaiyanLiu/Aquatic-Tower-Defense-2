@@ -294,6 +294,12 @@ public:
 	/** Anti-aliasing: false = FXAA (steady moving creatures), true = TSR (sharper, can ghost) */
 	bool IsSharpAA() const { return bSharpAA; }
 
+	/** HD art: the hand-drawn HD icons (atd.DetailedIcons 2, else 1) and the detailed interface (atd.DetailedUI) */
+	bool IsHDIcons() const { return bHDIcons; }
+	void SetHDIcons(bool bOn);
+	bool IsHDInterface() const { return bHDInterface; }
+	void SetHDInterface(bool bOn);
+
 	float GetSfxVolume() const { return SfxVolume; }
 	void SetSfxVolume(float Percent);
 	float GetMusicVolume() const { return MusicVolume; }
@@ -404,7 +410,6 @@ public:
 	 *  Per run: every new game starts off, saves keep it. */
 	int32 GetAutoSalvage() const { return AutoSalvage; }
 	void CycleAutoSalvage() { AutoSalvage = (AutoSalvage + 1) % 4; }
-	static const TCHAR* AutoSalvageName(int32 Level);
 
 	/** Collects a dropped item near a world point (when clicked). Returns true if there was one. */
 	bool TryClickPickup(const FVector& WorldPoint);
@@ -477,6 +482,8 @@ protected:
 	void UpdateAuras();
 	void LoadSettings();
 	void ApplyAntiAliasing() const;
+	/** Pushes the HD art settings into their console variables (only when they differ, so the icons are not repainted for nothing) */
+	void ApplyArtSettings() const;
 
 	/** Pushes the frame rate cap and VSync to the engine and saves them in GameUserSettings.ini */
 	void ApplyDisplaySettings();
@@ -537,6 +544,8 @@ protected:
 	bool bShowFps = false;
 	bool bVSync = false;
 	bool bSharpAA = false;
+	bool bHDIcons = true;
+	bool bHDInterface = true;
 	float SfxVolume = 100.0f;
 	float MusicVolume = 100.0f;
 	int32 ForcedMap = -1;

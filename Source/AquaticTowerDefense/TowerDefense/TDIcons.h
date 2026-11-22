@@ -17,7 +17,17 @@ enum class ETDIcon : uint8
 	Item,
 	Misc,
 	ItemKind,	// one per item type (id = TD::ItemKind index)
-	Boon		// one per run boon, cursed ones included (id = ETDBoon)
+	Boon,		// one per run boon, cursed ones included (id = ETDBoon)
+	Decor		// HUD decorations (id = ETDDecorIcon), always painted with the HD art
+};
+
+/** Little sea creatures the detailed interface sets on panel rims and the dock */
+enum class ETDDecorIcon : uint8
+{
+	Starfish,
+	Scallop,
+	Coral,
+	Count
 };
 
 enum class ETDMiscIcon : uint8
@@ -46,7 +56,10 @@ namespace TDIcons
 	/** True when atd.DetailedIcons asks for the detailed look */
 	bool UseDetailed();
 
-	/** Paints an icon (straight alpha, sRGB). Returns false if the id has no icon. Detail: -1 follows atd.DetailedIcons, 0 original, 1 detailed. */
+	/** The atd.DetailedIcons level: 0 original, 1 detailed, 2 hand-drawn HD */
+	int32 DetailLevel();
+
+	/** Paints an icon (straight alpha, sRGB). Returns false if the id has no icon. Detail: -1 follows atd.DetailedIcons, 0 original, 1 detailed, 2 HD. */
 	bool Render(ETDIcon Kind, int32 Id, int32 Size, TArray<FColor>& OutPixels, int32 Detail = -1);
 
 	/** Cached texture for an icon, or null if the id has no icon */
@@ -64,6 +77,7 @@ namespace TDIcons
 		return Texture ? Texture : Item(It.Slot);
 	}
 	inline UTexture2D* Misc(ETDMiscIcon Icon) { return Get(ETDIcon::Misc, (int32)Icon); }
+	inline UTexture2D* Decor(ETDDecorIcon Icon) { return Get(ETDIcon::Decor, (int32)Icon); }
 
 #if !UE_BUILD_SHIPPING
 	/** Writes contact sheets of every icon (full size and HUD size) and the Windows application icon into a folder */
@@ -71,5 +85,8 @@ namespace TDIcons
 
 	/** Writes before/after sheets (original left, detailed right) of every icon family into a folder */
 	bool ExportCompare(const FString& Directory);
+
+	/** Writes one family's contact sheet (Cell px icons, Columns wide) at the current detail level */
+	bool ExportFamily(ETDIcon Kind, const FString& Path, int32 Cell, int32 Columns);
 #endif
 }

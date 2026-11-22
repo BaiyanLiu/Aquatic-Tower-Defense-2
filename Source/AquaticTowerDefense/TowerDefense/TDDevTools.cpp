@@ -24,6 +24,7 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "StaticMeshResources.h"
+#include "ProfilingDebugging/MiscTrace.h"
 
 // ---------------------------------------------------------------------------------------------
 // Console commands (on the player controller)
@@ -150,6 +151,19 @@ void ATDPlayerController::ATDExportIcons()
 #endif
 }
 
+void ATDPlayerController::ATDIconSheet(int32 Kind, int32 Cell, int32 Columns)
+{
+#if !UE_BUILD_SHIPPING
+	const FString Path = FPaths::ProjectSavedDir() / TEXT("Icons") / FString::Printf(TEXT("Family_%d.png"), Kind);
+	const bool bOk = TDIcons::ExportFamily((ETDIcon)FMath::Clamp(Kind, 0, 255), Path, FMath::Clamp(Cell, 16, 1024), FMath::Max(1, Columns));
+	UE_LOG(LogAquaticTowerDefense, Display, TEXT("ICONSHEET %s: %s"), *Path, bOk ? TEXT("ok") : TEXT("failed"));
+	if (FParse::Param(FCommandLine::Get(), TEXT("ATDIconQuit")))
+	{
+		FPlatformMisc::RequestExit(false);
+	}
+#endif
+}
+
 void ATDPlayerController::ATDSim(int32 Strategy, int32 Waves, float TimeScale)
 {
 #if !UE_BUILD_SHIPPING
@@ -199,6 +213,7 @@ bool FTDTour::Tick(float RealDeltaTime)
 		// with -ATDTourFull: the victory menu, a dock tooltip and the armed Sell button too
 		TEXT("ATDMenu 5"), TEXT("Shot showui"),
 		TEXT("ATDMenu 0"), TEXT("ATDCursor 0.17 0.93"), TEXT("Shot showui"),	// tooltip on a dock card
+		TEXT("ATDCursor 0.475 0.04"), TEXT("Shot showui"), TEXT("ATDCursor 0.455 0.082"), TEXT("Shot showui"),				// next-wave tooltip: odds, armor, your best towers, counter tip
 		TEXT("ATDCursor -1 -1"), TEXT("ATDSellCard"), TEXT("Shot showui"),
 		TEXT("ATDMenu 6"), TEXT("Shot showui"),							// new game setup
 		TEXT("ATDBoons 1"), TEXT("Shot showui"),						// boon offer with a cursed card (left open: it waits for a pick)
@@ -579,6 +594,8 @@ void FTDUITest::BuildScript()
 	Do(TEXT("add test pearls"), [G]() { G()->DebugAddPearls(2000); });
 	Do(TEXT("hover dock slot 5"), [Hover]() { Hover(EB::Slot, 5); });
 	Check(TEXT("dock tooltip shows Mantis Shrimp"), [WeakPC]() { return HUDOf(WeakPC.Get())->GetLastTipTitle().Contains(TEXT("Mantis")); });
+	Do(TEXT("hover the first next-wave group"), [Hover]() { Hover(EB::PreviewEntry, 0); });
+	Check(TEXT("next-wave tooltip names the creature and count"), [WeakPC]() { return HUDOf(WeakPC.Get())->GetLastTipTitle().Contains(TEXT("  x")); });
 	Do(TEXT("click dock slot 1 (Coral Wall)"), [Click]() { Click(EB::Slot, 0); });
 	Check(TEXT("wall selected"), [P]() { return P()->GetSelectedType() == ETDTowerType::Wall; });
 
@@ -1901,6 +1918,45 @@ namespace
 			UE_LOG(LogAquaticTowerDefense, Display, TEXT("CENSUS mesh %8.0fk  %s"), P.Value.Value / 1e3, *P.Value.Key);
 		}
 	}
+
+	/** Which primitives moved since the last call: counts per owner class and component class, so per-frame transform updates can be traced to their source */
+	void LogMovingCensus(UWorld* World, TMap<TWeakObjectPtr<UPrimitiveComponent>, FTransform>& Last, bool bReport)
+	{
+		TMap<FString, int32> Moved;
+		int32 Total = 0, Prims = 0;
+		TMap<TWeakObjectPtr<UPrimitiveComponent>, FTransform> Now;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			for (UActorComponent* C : It->GetComponents())
+			{
+				UPrimitiveComponent* P = Cast<UPrimitiveComponent>(C);
+				if (!P || !P->IsRegistered() || !P->SceneProxy)
+				{
+					continue;
+				}
+				++Prims;
+				Now.Add(P, P->GetComponentTransform());
+				if (const FTransform* Old = Last.Find(P))
+				{
+					if (!Old->Equals(P->GetComponentTransform(), 0.0f))
+					{
+						++Total;
+						Moved.FindOrAdd(FString::Printf(TEXT("%s %s%s"), *It->GetClass()->GetName(), *P->GetClass()->GetName(), P->bCastHiddenShadow ? TEXT(" (shadow copy)") : TEXT("")))++;
+					}
+				}
+			}
+		}
+		if (bReport)
+		{
+			UE_LOG(LogAquaticTowerDefense, Display, TEXT("MOVING %d of %d primitives moved in one frame"), Total, Prims);
+			Moved.ValueSort([](int32 A, int32 B) { return A > B; });
+			for (const TPair<FString, int32>& M : Moved)
+			{
+				UE_LOG(LogAquaticTowerDefense, Display, TEXT("MOVING %5d  %s"), M.Value, *M.Key);
+			}
+		}
+		Last = MoveTemp(Now);
+	}
 }
 
 void FTDPerf::Sample(float RealDeltaTime)
@@ -1930,6 +1986,19 @@ void FTDPerf::Report(const TCHAR* Label)
 	const float Best = FrameTimes.Num() > 0 ? FrameTimes[FrameTimes.Num() / 10] : 0.0f;
 	UE_LOG(LogAquaticTowerDefense, Display, TEXT("PERF %s: %.0f fps (best tenth %.0f fps)  frame %.2f ms  game %.2f ms  render %.2f ms  gpu %.2f ms  worst %.1f ms  draws %.0f  triangles %.0f  enemies %d  components %d"),
 		Label, 1000.0 / (FrameMs / N), Best > 0.0f ? 1000.0f / Best : 0.0f, FrameMs / N, GameMs / N, RenderMs / N, GpuMs / N, WorstMs, DrawCalls / N, Primitives / N, M->GetEnemies().Num(), Components);
+	// the median and the hitches (frames of 15 ms or more) and their share of the time: averages hide which one moved
+	const float Median = FrameTimes.Num() > 0 ? FrameTimes[FrameTimes.Num() / 2] : 0.0f;
+	int32 Hitches = 0;
+	double HitchMs = 0.0;
+	for (float Ms : FrameTimes)
+	{
+		if (Ms >= 15.0f)
+		{
+			++Hitches;
+			HitchMs += Ms;
+		}
+	}
+	UE_LOG(LogAquaticTowerDefense, Display, TEXT("PERF %s: median frame %.2f ms  hitches %d (%.0f%% of the time)"), Label, Median, Hitches, FrameMs > 0.0 ? 100.0 * HitchMs / FrameMs : 0.0);
 	if (FCString::Strcmp(Label, TEXT("WHILE SPAWNING")) != 0)
 	{
 		LogTriangleCensus(PC->GetWorld());
@@ -1945,7 +2014,11 @@ bool FTDPerf::Tick(float RealDeltaTime)
 	{
 		return false;
 	}
-	GEngine->SetMaxFPS(0.0f);
+	// uncapped; set only when it changed, since setting the cvar every frame runs every console variable sink each frame
+	if (GEngine->GetMaxFPS() != 0.0f)
+	{
+		GEngine->SetMaxFPS(0.0f);
+	}
 	PhaseTime += RealDeltaTime;
 
 	switch (Phase)
@@ -1971,6 +2044,7 @@ bool FTDPerf::Tick(float RealDeltaTime)
 				bCsvRunning = true;
 				PC->ConsoleCommand(TEXT("r.GPUCsvStatsEnabled 1"));
 				PC->ConsoleCommand(TEXT("csvprofile start"));
+				TRACE_BEGIN_REGION(TEXT("ATDPerfEmpty"));
 			}
 			Sample(RealDeltaTime);
 		}
@@ -1980,6 +2054,7 @@ bool FTDPerf::Tick(float RealDeltaTime)
 			{
 				bCsvRunning = false;
 				PC->ConsoleCommand(TEXT("csvprofile stop"));
+				TRACE_END_REGION(TEXT("ATDPerfEmpty"));
 			}
 			Report(TEXT("EMPTY BOARD"));
 			Phase = 2;
@@ -2006,14 +2081,65 @@ bool FTDPerf::Tick(float RealDeltaTime)
 		break;
 	}
 	case 3:
+	{
 		if (PhaseTime > 2.0f)
 		{
 			if (!bCsvRunning && !bShotTaken && FParse::Param(FCommandLine::Get(), TEXT("ATDPerfCsv")))
 			{
 				bCsvRunning = true;
 				PC->ConsoleCommand(TEXT("csvprofile start"));
+				TRACE_BEGIN_REGION(TEXT("ATDPerfHeavy"));
 			}
 			Sample(RealDeltaTime);
+		}
+		if (PhaseTime > 11.0f && CensusStep < 2)
+		{
+			LogMovingCensus(PC->GetWorld(), CensusTransforms, CensusStep == 1);
+			++CensusStep;
+		}
+		FString CompareCommand;
+		if (PhaseTime > 12.0f && FParse::Value(FCommandLine::Get(), TEXT("ATDCompare="), CompareCommand, false))
+		{
+			// pause so both shots show the same moment, let the lighting settle, shoot, apply the change, settle again, shoot
+			CompareCommand.TrimQuotesInline();
+			CompareTime += RealDeltaTime;
+			if (CompareStep == 0)
+			{
+				if (bCsvRunning)
+				{
+					bCsvRunning = false;
+					PC->ConsoleCommand(TEXT("csvprofile stop"));
+				}
+				UGameplayStatics::SetGamePaused(PC.Get(), true);
+				CompareStep = 1;
+				CompareTime = 0.0f;
+			}
+			else if (CompareStep == 1 && CompareTime > 3.0f)
+			{
+				UE_LOG(LogAquaticTowerDefense, Display, TEXT("COMPARE before"));
+				PC->ConsoleCommand(TEXT("Shot showui"));
+				CompareStep = 2;
+				CompareTime = 0.0f;
+			}
+			else if (CompareStep == 2 && CompareTime > 1.0f)
+			{
+				PC->ConsoleCommand(CompareCommand);
+				CompareStep = 3;
+				CompareTime = 0.0f;
+			}
+			else if (CompareStep == 3 && CompareTime > 5.0f)
+			{
+				UE_LOG(LogAquaticTowerDefense, Display, TEXT("COMPARE after: %s"), *CompareCommand);
+				PC->ConsoleCommand(TEXT("Shot showui"));
+				CompareStep = 4;
+				CompareTime = 0.0f;
+			}
+			else if (CompareStep == 4 && CompareTime > 2.0f)
+			{
+				UE_LOG(LogAquaticTowerDefense, Display, TEXT("PERF DONE"));
+				return false;
+			}
+			return true;
 		}
 		if (PhaseTime > 12.0f && !bShotTaken)
 		{
@@ -2021,6 +2147,7 @@ bool FTDPerf::Tick(float RealDeltaTime)
 			{
 				bCsvRunning = false;
 				PC->ConsoleCommand(TEXT("csvprofile stop"));
+				TRACE_END_REGION(TEXT("ATDPerfHeavy"));
 			}
 			bShotTaken = true;
 			PC->ConsoleCommand(TEXT("Shot showui"));
@@ -2035,6 +2162,7 @@ bool FTDPerf::Tick(float RealDeltaTime)
 			return false;
 		}
 		break;
+	}
 	default:
 		break;
 	}

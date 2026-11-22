@@ -23,6 +23,7 @@
 #include "TDIcons.h"
 #include "Engine/Texture2D.h"
 #include "TextureResource.h"
+#include "HAL/IConsoleManager.h"
 
 using namespace TDHUDStyle;
 
@@ -220,6 +221,680 @@ namespace
 		return Slot;
 	}
 
+	// ---------------------------------------------------------------- detailed look (atd.DetailedUI): painted rims and lips
+
+	TAutoConsoleVariable<int32> CVarDetailedUI(
+		TEXT("atd.DetailedUI"),
+		1,
+		TEXT("1 draws the interface with the detailed look: nacre rims, glass buttons and meters, recessed item wells tinted by rarity; 0 the plain shapes."));
+
+	bool DetailedUI()
+	{
+		return CVarDetailedUI.GetValueOnGameThread() != 0;
+	}
+
+	/** A per-point function (linear colour, straight alpha) 4x supersampled into premultiplied texels, so filtering never darkens edges */
+	TArray<FLinearColor> PaintPremultiplied(int32 Size, TFunctionRef<FLinearColor(float X, float Y)> Paint)
+	{
+		TArray<FLinearColor> Texels;
+		Texels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				FLinearColor Sum(0, 0, 0, 0);
+				for (int32 S = 0; S < 4; ++S)
+				{
+					const FLinearColor C = Paint(X + 0.25f + 0.5f * (S & 1), Y + 0.25f + 0.5f * (S >> 1));
+					const float A = FMath::Clamp(C.A, 0.0f, 1.0f);
+					Sum += FLinearColor(C.R * A, C.G * A, C.B * A, A);
+				}
+				Texels[Y * Size + X] = Sum * 0.25f;
+			}
+		}
+		return Texels;
+	}
+
+	/** A coloured texture from a per-point function (linear colour, straight alpha), 4x supersampled, stored sRGB with box-filtered mips */
+	UTexture2D* MakePaintedTexture(int32 Size, TFunctionRef<FLinearColor(float X, float Y)> Paint, const TCHAR* BaseName)
+	{
+		const FName Name = MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(BaseName));
+		UTexture2D* Texture = UTexture2D::CreateTransient(Size, Size, PF_B8G8R8A8, Name);
+		if (!Texture)
+		{
+			return nullptr;
+		}
+		Texture->SRGB = true;
+		Texture->Filter = TF_Trilinear;
+		Texture->AddressX = TA_Clamp;
+		Texture->AddressY = TA_Clamp;
+		Texture->NeverStream = true;
+
+		TArray<FLinearColor> Texels = PaintPremultiplied(Size, Paint);
+		FTexturePlatformData* Data = Texture->GetPlatformData();
+		int32 MipSize = Size;
+		for (int32 Level = 0; MipSize >= 4; ++Level)
+		{
+			FTexture2DMipMap* MipMap = Level == 0 ? &Data->Mips[0] : new FTexture2DMipMap(MipSize, MipSize, 1);
+			if (Level > 0)
+			{
+				Data->Mips.Add(MipMap);
+			}
+			TArray<FColor> Pixels;
+			Pixels.SetNumUninitialized(MipSize * MipSize);
+			for (int32 i = 0; i < Pixels.Num(); ++i)
+			{
+				const FLinearColor& P = Texels[i];
+				const FLinearColor Straight = P.A > 1e-4f ? FLinearColor(P.R / P.A, P.G / P.A, P.B / P.A, P.A) : FLinearColor(0, 0, 0, 0);
+				Pixels[i] = Straight.GetClamped().ToFColor(true);
+			}
+			const int64 Bytes = (int64)Pixels.Num() * sizeof(FColor);
+			MipMap->BulkData.Lock(LOCK_READ_WRITE);
+			FMemory::Memcpy(MipMap->BulkData.Realloc(Bytes), Pixels.GetData(), Bytes);
+			MipMap->BulkData.Unlock();
+			if (MipSize > 4)
+			{
+				const int32 Next = MipSize / 2;
+				TArray<FLinearColor> Smaller;
+				Smaller.SetNumUninitialized(Next * Next);
+				for (int32 Y = 0; Y < Next; ++Y)
+				{
+					for (int32 X = 0; X < Next; ++X)
+					{
+						Smaller[Y * Next + X] = (Texels[(Y * 2) * MipSize + X * 2] + Texels[(Y * 2) * MipSize + X * 2 + 1]
+							+ Texels[(Y * 2 + 1) * MipSize + X * 2] + Texels[(Y * 2 + 1) * MipSize + X * 2 + 1]) * 0.25f;
+					}
+				}
+				Texels = MoveTemp(Smaller);
+			}
+			MipSize /= 2;
+		}
+		Texture->UpdateResource();
+		Texture->AddToRoot();
+		return Texture;
+	}
+
+	/** The rounded square of the shape textures at a texel: signed distance (negative inside) and the outward direction */
+	float ShapeDistance(float X, float Y, FVector2f& Outward)
+	{
+		const float Half = ShapeSize * 0.5f;
+		const float Straight = Half - ShapeCorner;
+		const float DX = X - Half, DY = Y - Half;
+		const float PX = FMath::Max(FMath::Abs(DX) - Straight, 0.0f);
+		const float PY = FMath::Max(FMath::Abs(DY) - Straight, 0.0f);
+		const FVector2f P(PX * FMath::Sign(DX), PY * FMath::Sign(DY));
+		Outward = P.SizeSquared() > 1e-6f ? P.GetSafeNormal() : (FMath::Abs(DX) > FMath::Abs(DY) ? FVector2f(FMath::Sign(DX), 0.0f) : FVector2f(0.0f, FMath::Sign(DY)));
+		return FMath::Sqrt(PX * PX + PY * PY) - ShapeCorner;
+	}
+
+	float SmoothStep01(float A, float B, float X)
+	{
+		const float T = FMath::Clamp((X - A) / (B - A), 0.0f, 1.0f);
+		return T * T * (3.0f - 2.0f * T);
+	}
+
+	/** Light from the upper left, as in the painted previews */
+	const FVector3f LightDir = FVector3f(-0.55f, -0.83f, 0.75f).GetSafeNormal();
+
+	/** Mother-of-pearl: pale with pastel pink, mint and lilac shifting round the shape */
+	FLinearColor Nacre(float Angle, float Along, float Amount)
+	{
+		const float T = FMath::Sin(Angle * 2.0f + Along * 0.1f) * 0.5f + 0.5f;
+		const FLinearColor Pink(1.0f, 0.65f, 0.78f), Mint(0.58f, 1.0f, 0.87f), Lilac(0.64f, 0.67f, 1.0f);
+		const FLinearColor Shift = T < 0.5f ? FMath::Lerp(Pink, Mint, T * 2.0f) : FMath::Lerp(Mint, Lilac, (T - 0.5f) * 2.0f);
+		return FMath::Lerp(FLinearColor::White, Shift, Amount);
+	}
+
+	/** The nacre frame's colour at a texel for a band W texels wide (see RimTexture) */
+	FLinearColor PaintRim(float W, float X, float Y)
+	{
+		FVector2f Out;
+		const float D = ShapeDistance(X, Y, Out);
+		const float Ink = FMath::Clamp(W * 0.18f, 0.6f, 1.2f);		// keyline width
+		const float Alpha = FMath::Clamp(0.5f - (D - Ink * 0.5f), 0.0f, 1.0f) * FMath::Clamp(D + W + Ink * 0.5f + 0.5f, 0.0f, 1.0f);
+		if (Alpha <= 0.0f)
+		{
+			return FLinearColor(0, 0, 0, 0);
+		}
+		const float T = FMath::Clamp(-D / W, 0.0f, 1.0f);		// 0 at the outer edge, 1 at the inner
+		// a rounded band: its surface tilts outward on the outer half and inward on the inner half
+		const float Slope = FMath::Cos(T * PI) * 0.9f;
+		const FVector3f N = FVector3f(Out.X * Slope, Out.Y * Slope, 1.0f).GetSafeNormal();
+		const float Diffuse = FMath::Max(0.0f, FVector3f::DotProduct(N, LightDir));
+		const FVector3f H = (LightDir + FVector3f(0, 0, 1)).GetSafeNormal();
+		const float Spec = FMath::Pow(FMath::Max(0.0f, FVector3f::DotProduct(N, H)), 28.0f) * 0.55f;
+		const float Shade = 0.5f + 0.5f * Diffuse;
+		const float Angle = FMath::Atan2(Y - ShapeSize * 0.5f, X - ShapeSize * 0.5f);
+		const float Grain = 1.0f + 0.07f * FMath::Sin(T * 9.0f * PI);
+		FLinearColor C = Nacre(Angle, X + Y, 0.3f) * (Shade * Grain) + FLinearColor(Spec, Spec, Spec, 0.0f);
+		// dark keylines on both edges
+		const float Key0 = SmoothStep01(Ink, 0.0f, FMath::Abs(D));
+		const float Key1 = SmoothStep01(Ink, 0.0f, FMath::Abs(D + W));
+		C = FMath::Lerp(C, FLinearColor(0.004f, 0.01f, 0.015f), FMath::Max(Key0 * 0.85f, Key1 * 0.7f));
+		C.A = Alpha;
+		return C;
+	}
+
+	/** A nacre frame for NineSlice: a rounded band Width texels wide, lit from the upper left, with fine growth layers along it and
+	 *  a dark keyline either side. Near white: the draw colour tints it. */
+	UTexture2D* RimTexture(float Width)
+	{
+		static TMap<int32, UTexture2D*> Cache;
+		const int32 Key = FMath::Clamp(FMath::RoundToInt(Width * 4.0f), 8, (int32)(ShapeCorner * 2.0f));
+		if (UTexture2D** Found = Cache.Find(Key))
+		{
+			return *Found;
+		}
+		const float W = Key / 4.0f;
+		UTexture2D* Texture = MakePaintedTexture(ShapeSize, [W](float X, float Y) { return PaintRim(W, X, Y); }, TEXT("TDHUDRim"));
+		Cache.Add(Key, Texture);
+		return Texture;
+	}
+
+	/** The inner lip's colour at a texel, fading inward over W texels (see LipTexture) */
+	FLinearColor PaintLip(float W, float X, float Y)
+	{
+		FVector2f Out;
+		const float D = ShapeDistance(X, Y, Out);
+		if (D > 0.0f)
+		{
+			return FLinearColor(0, 0, 0, 0);
+		}
+		const float Fade = SmoothStep01(W, 0.0f, -D);
+		const float Facing = FVector2f::DotProduct(Out, FVector2f(LightDir.X, LightDir.Y).GetSafeNormal());
+		return Facing > 0.0f ? FLinearColor(0.85f, 0.98f, 1.0f, Fade * Facing) : FLinearColor(0.0f, 0.0f, 0.0f, Fade * -Facing);
+	}
+
+	/** The pearl's colour at a texel of its 64 texel tile (see PearlTexture) */
+	FLinearColor PaintPearl(float X, float Y)
+	{
+		const float R = 30.0f;
+		const FVector2f P(X - 32.0f, Y - 32.0f);
+		const float D = P.Size() - R;
+		const float Alpha = FMath::Clamp(0.5f - D, 0.0f, 1.0f);
+		if (Alpha <= 0.0f)
+		{
+			return FLinearColor(0, 0, 0, 0);
+		}
+		const float Q = FMath::Min(P.Size() / R, 1.0f);
+		const FVector3f N = FVector3f(P.X / R, P.Y / R, FMath::Sqrt(FMath::Max(0.0f, 1.0f - Q * Q))).GetSafeNormal();
+		const float Diffuse = FMath::Max(0.0f, FVector3f::DotProduct(N, LightDir));
+		const FVector3f H = (LightDir + FVector3f(0, 0, 1)).GetSafeNormal();
+		const float Spec = FMath::Pow(FMath::Max(0.0f, FVector3f::DotProduct(N, H)), 28.0f) * 0.7f;
+		const FLinearColor Base(0.89f, 0.9f, 0.94f), Dark(0.27f, 0.31f, 0.48f);
+		FLinearColor C = FMath::Lerp(Dark, Base, FMath::Clamp((0.55f + 0.45f * Diffuse - 0.35f) / 0.65f, 0.0f, 1.0f));
+		C = FMath::Lerp(C, Nacre(FMath::Atan2(P.Y, P.X), 0.0f, 0.9f) * C.GetMax(), SmoothStep01(0.3f, 1.0f, Q) * 0.28f);
+		C += FLinearColor(Spec, Spec, Spec, 0.0f);
+		C = FMath::Lerp(C, FLinearColor(0, 0, 0), SmoothStep01(1.6f, 0.0f, FMath::Abs(D)) * 0.35f);
+		C.A = Alpha;
+		return C;
+	}
+
+	/** The bubble's colour at a texel of its 64 texel tile (see BubbleTexture) */
+	FLinearColor PaintBubble(float X, float Y)
+	{
+		const float R = 29.0f;
+		const FVector2f P(X - 32.0f, Y - 32.0f);
+		const float D = P.Size() - R;
+		if (D > 1.0f)
+		{
+			return FLinearColor(0, 0, 0, 0);
+		}
+		const float Q = FMath::Min(P.Size() / R, 1.0f);
+		const float Lit = FMath::Clamp(-(P.X * LightDir.X + P.Y * LightDir.Y) / R * 0.5f + 0.5f, 0.0f, 1.0f);
+		// the body is nearly clear, thickening toward the rim
+		float A = 0.08f + 0.22f * FMath::Pow(Q, 6.0f);
+		FLinearColor C(0.75f, 0.95f, 1.0f, 1.0f);
+		// the rim: a crisp edge, brighter on the lit side
+		const float Rim = SmoothStep01(4.8f, 0.0f, FMath::Abs(D + 2.6f));
+		A = FMath::Max(A, Rim * (0.55f + 0.4f * Lit));
+		C = FMath::Lerp(C, FLinearColor::White, Rim * Lit);
+		// a curved window glint on the upper left and a small reflection lower right
+		const float Ang = FMath::Atan2(P.Y, P.X);
+		const float Arc = SmoothStep01(4.5f, 0.0f, FMath::Abs(P.Size() - R * 0.66f)) * SmoothStep01(0.55f, 0.0f, FMath::Abs(Ang + 2.25f));
+		const float Dot = SmoothStep01(5.5f, 2.5f, (P - FVector2f(R * 0.4f, R * 0.42f)).Size());
+		A = FMath::Max(A, FMath::Max(Arc * 0.95f, Dot * 0.6f));
+		C = FMath::Lerp(C, FLinearColor::White, FMath::Max(Arc, Dot));
+		C.A = A * FMath::Clamp(0.5f - D, 0.0f, 1.0f);
+		return C;
+	}
+
+	/** The inner lip of a glass panel for NineSlice: a light edge along the top left and a shadow along the bottom right, fading
+	 *  inward over Width texels. Drawn untinted. */
+	UTexture2D* LipTexture(float Width)
+	{
+		static TMap<int32, UTexture2D*> Cache;
+		const int32 Key = FMath::Clamp(FMath::RoundToInt(Width * 4.0f), 4, (int32)(ShapeCorner * 3.0f));
+		if (UTexture2D** Found = Cache.Find(Key))
+		{
+			return *Found;
+		}
+		const float W = Key / 4.0f;
+		UTexture2D* Texture = MakePaintedTexture(ShapeSize, [W](float X, float Y) { return PaintLip(W, X, Y); }, TEXT("TDHUDLip"));
+		Cache.Add(Key, Texture);
+		return Texture;
+	}
+
+	/** A pearl: a lit white ball with a pastel orient toward its rim, a glint and a faint dark outline. Drawn tinted for beads. */
+	UTexture2D* PearlTexture()
+	{
+		static UTexture2D* Texture = nullptr;
+		if (!Texture)
+		{
+			Texture = MakePaintedTexture(64, [](float X, float Y) { return PaintPearl(X, Y); }, TEXT("TDHUDPearl"));
+		}
+		return Texture;
+	}
+
+	/** A soap-clear bubble: a faint tinted body, a thin rim brighter on the lit side, a curved glint and a small back reflection.
+	 *  Near white: the draw colour tints it. */
+	UTexture2D* BubbleTexture()
+	{
+		static UTexture2D* Texture = nullptr;
+		if (!Texture)
+		{
+			Texture = MakePaintedTexture(64, [](float X, float Y) { return PaintBubble(X, Y); }, TEXT("TDHUDBubble"));
+		}
+		return Texture;
+	}
+
+	// ---------------------------------------------------------------- one atlas for every interface shape
+	//
+	// The canvas starts a new draw (a render pass of its own) whenever the texture changes, and the detailed look layers shadow,
+	// fill, sheen, lip, rim and pearls from different textures, so a frame came to several hundred draws. Every shape above is
+	// painted into cells of one texture instead, with the same texels and mips as its own texture had, so runs of shapes batch.
+	// Each cell sits in a 96 texel slot with a gutter that repeats its edge texels (or wraps, for the wave), which keeps
+	// filtering exactly as it was with clamped textures, down to the 4x4 mip of a 64 texel shape.
+
+	TAutoConsoleVariable<int32> CVarHUDAtlas(
+		TEXT("atd.HUDAtlas"),
+		1,
+		TEXT("1 draws the interface's shapes from one atlas texture so they batch into few draws; 0 from a texture per shape (the same pixels, many more draws)."));
+
+	/** Cell keys: kinds below 1000 are single cells, outline widths add their quarter-texel key to the kind's base */
+	enum EAtlasKey : int32
+	{
+		AtlasWhite = 1, AtlasFill, AtlasGlow, AtlasPearl, AtlasBubble, AtlasWaveLine, AtlasWaveFilled,
+		AtlasRingBase = 1000, AtlasRimBase = 2000, AtlasLipBase = 3000
+	};
+
+	int32 RingWidthKey(float RingWidth) { return FMath::Clamp(FMath::RoundToInt(RingWidth * 4.0f), 2, (int32)(ShapeCorner * 4.0f)); }
+	int32 RimWidthKey(float Width) { return FMath::Clamp(FMath::RoundToInt(Width * 4.0f), 8, (int32)(ShapeCorner * 2.0f)); }
+	int32 LipWidthKey(float Width) { return FMath::Clamp(FMath::RoundToInt(Width * 4.0f), 4, (int32)(ShapeCorner * 3.0f)); }
+
+	/** A cell's content: premultiplied linear texels, W x H */
+	struct FAtlasImage
+	{
+		int32 W = 0, H = 0;
+		bool bWrapX = false;
+		TArray<FLinearColor> Texels;
+	};
+
+	FAtlasImage MakeAtlasImage(int32 Key)
+	{
+		FAtlasImage Image;
+		Image.W = Image.H = ShapeSize;
+		auto Shape = [&Image](EShape Shape, float RingWidth)
+		{
+			Image.Texels.SetNumUninitialized(ShapeSize * ShapeSize);
+			for (int32 Y = 0; Y < ShapeSize; ++Y)
+			{
+				for (int32 X = 0; X < ShapeSize; ++X)
+				{
+					const float A = FMath::Clamp(ShapeAlpha(Shape, X, Y, RingWidth), 0.0f, 1.0f);
+					Image.Texels[Y * ShapeSize + X] = FLinearColor(A, A, A, A);
+				}
+			}
+		};
+		if (Key == AtlasWhite)
+		{
+			Image.Texels.Init(FLinearColor::White, ShapeSize * ShapeSize);
+		}
+		else if (Key == AtlasFill)
+		{
+			Shape(EShape::Fill, 0.0f);
+		}
+		else if (Key == AtlasGlow)
+		{
+			Shape(EShape::Glow, 0.0f);
+		}
+		else if (Key == AtlasPearl)
+		{
+			Image.Texels = PaintPremultiplied(64, [](float X, float Y) { return PaintPearl(X, Y); });
+		}
+		else if (Key == AtlasBubble)
+		{
+			Image.Texels = PaintPremultiplied(64, [](float X, float Y) { return PaintBubble(X, Y); });
+		}
+		else if (Key == AtlasWaveLine || Key == AtlasWaveFilled)
+		{
+			// the same 4x4 supersampled coverage as MakeWaveTexture
+			const bool bFilled = Key == AtlasWaveFilled;
+			Image.W = WaveW;
+			Image.H = WaveH;
+			Image.bWrapX = true;
+			Image.Texels.SetNumUninitialized(WaveW * WaveH);
+			for (int32 Y = 0; Y < WaveH; ++Y)
+			{
+				for (int32 X = 0; X < WaveW; ++X)
+				{
+					float Coverage = 0.0f;
+					for (int32 SY = 0; SY < 4; ++SY)
+					{
+						for (int32 SX = 0; SX < 4; ++SX)
+						{
+							const float PX = X + (SX + 0.5f) / 4.0f;
+							const float PY = Y + (SY + 0.5f) / 4.0f;
+							const float Curve = WaveCurve(PX);
+							Coverage += (bFilled ? PY < Curve : FMath::Abs(PY - Curve) < 0.75f) ? 1.0f / 16.0f : 0.0f;
+						}
+					}
+					const float A = FMath::RoundToInt(Coverage * 255.0f) / 255.0f;
+					Image.Texels[Y * WaveW + X] = FLinearColor(A, A, A, A);
+				}
+			}
+		}
+		else if (Key >= AtlasLipBase)
+		{
+			const float W = (Key - AtlasLipBase) / 4.0f;
+			Image.Texels = PaintPremultiplied(ShapeSize, [W](float X, float Y) { return PaintLip(W, X, Y); });
+		}
+		else if (Key >= AtlasRimBase)
+		{
+			const float W = (Key - AtlasRimBase) / 4.0f;
+			Image.Texels = PaintPremultiplied(ShapeSize, [W](float X, float Y) { return PaintRim(W, X, Y); });
+		}
+		else if (Key >= AtlasRingBase)
+		{
+			Shape(EShape::Ring, (Key - AtlasRingBase) / 4.0f);
+		}
+		return Image;
+	}
+
+	class FHUDAtlas
+	{
+	public:
+		static constexpr int32 Slot = 96;
+		static constexpr int32 PerRow = 16;
+		static constexpr int32 Size = Slot * PerRow;
+		static constexpr int32 Mips = 5;		// down to 4x4 for a 64 texel cell, as its own texture had
+
+		/** The atlas UVs of a cell's content, made on first use; false when the atlas could not take it */
+		bool Cell(int32 Key, FBox2f& OutUV)
+		{
+			if (CVarHUDAtlas.GetValueOnGameThread() == 0)
+			{
+				return false;
+			}
+			if (const FBox2f* Found = Cells.Find(Key))
+			{
+				OutUV = *Found;
+				return true;
+			}
+			if (bFull || !Init())
+			{
+				return false;
+			}
+			const FAtlasImage Image = MakeAtlasImage(Key);
+			const int32 Span = FMath::DivideAndRoundUp(Image.W + 32, Slot);
+			if (Image.Texels.Num() != Image.W * Image.H || Image.H + 32 > Slot || Span > PerRow)
+			{
+				return false;
+			}
+			if (NextSlot % PerRow + Span > PerRow)
+			{
+				NextSlot += PerRow - NextSlot % PerRow;
+			}
+			if (NextSlot + Span > PerRow * PerRow)
+			{
+				bFull = true;
+				return false;
+			}
+			const int32 SX = (NextSlot % PerRow) * Slot, SY = (NextSlot / PerRow) * Slot;
+			NextSlot += Span;
+			Write(Image, SX, SY, Span * Slot, Slot);
+			const int32 OX = (Span * Slot - Image.W) / 2, OY = (Slot - Image.H) / 2;
+			const FBox2f UV(FVector2f((float)(SX + OX) / Size, (float)(SY + OY) / Size), FVector2f((float)(SX + OX + Image.W) / Size, (float)(SY + OY + Image.H) / Size));
+			Cells.Add(Key, UV);
+			OutUV = UV;
+			return true;
+		}
+
+		const FTexture* Resource() const
+		{
+			return Texture ? Texture->GetResource() : nullptr;
+		}
+
+	private:
+		bool Init()
+		{
+			if (Texture)
+			{
+				return true;
+			}
+			const FName Name = MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(TEXT("TDHUDAtlas")));
+			UTexture2D* New = UTexture2D::CreateTransient(Size, Size, PF_B8G8R8A8, Name);
+			if (!New)
+			{
+				bFull = true;
+				return false;
+			}
+			New->SRGB = true;
+			New->Filter = TF_Trilinear;
+			New->AddressX = TA_Clamp;
+			New->AddressY = TA_Clamp;
+			New->NeverStream = true;
+			FTexturePlatformData* Data = New->GetPlatformData();
+			for (int32 Level = 0; Level < Mips; ++Level)
+			{
+				const int32 MipSize = Size >> Level;
+				// the copies stay for the atlas's lifetime: region updates read them on the render thread
+				MipData[Level].SetNumZeroed(MipSize * MipSize);
+				FTexture2DMipMap* MipMap = Level == 0 ? &Data->Mips[0] : new FTexture2DMipMap(MipSize, MipSize, 1);
+				if (Level > 0)
+				{
+					Data->Mips.Add(MipMap);
+				}
+				const int64 Bytes = (int64)MipData[Level].Num() * sizeof(FColor);
+				MipMap->BulkData.Lock(LOCK_READ_WRITE);
+				FMemory::Memcpy(MipMap->BulkData.Realloc(Bytes), MipData[Level].GetData(), Bytes);
+				MipMap->BulkData.Unlock();
+			}
+			New->UpdateResource();
+			New->AddToRoot();
+			Texture = New;
+			return true;
+		}
+
+		/** Pads the image to its slot (edges repeated, or wrapped sideways), box-filters it down the mips premultiplied, and uploads
+		 *  the slot's region of every mip */
+		void Write(const FAtlasImage& Image, int32 SX, int32 SY, int32 RW, int32 RH)
+		{
+			const int32 OX = (RW - Image.W) / 2, OY = (RH - Image.H) / 2;
+			TArray<FLinearColor> Level;
+			Level.SetNumUninitialized(RW * RH);
+			for (int32 Y = 0; Y < RH; ++Y)
+			{
+				const int32 CY = FMath::Clamp(Y - OY, 0, Image.H - 1);
+				for (int32 X = 0; X < RW; ++X)
+				{
+					const int32 CX = Image.bWrapX ? (((X - OX) % Image.W) + Image.W) % Image.W : FMath::Clamp(X - OX, 0, Image.W - 1);
+					Level[Y * RW + X] = Image.Texels[CY * Image.W + CX];
+				}
+			}
+			int32 W = RW, H = RH;
+			for (int32 Mip = 0; Mip < Mips; ++Mip)
+			{
+				const int32 MipSize = Size >> Mip;
+				const int32 DX = SX >> Mip, DY = SY >> Mip;
+				for (int32 Y = 0; Y < H; ++Y)
+				{
+					for (int32 X = 0; X < W; ++X)
+					{
+						const FLinearColor& P = Level[Y * W + X];
+						FColor& Out = MipData[Mip][(DY + Y) * MipSize + DX + X];
+						if (P.A > 1e-4f)
+						{
+							Out = FLinearColor(P.R / P.A, P.G / P.A, P.B / P.A, 1.0f).GetClamped().ToFColor(true);
+							Out.A = (uint8)FMath::RoundToInt(FMath::Clamp(P.A, 0.0f, 1.0f) * 255.0f);
+						}
+						else
+						{
+							Out = FColor(0, 0, 0, 0);
+						}
+					}
+				}
+				FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(DX, DY, DX, DY, W, H);
+				Texture->UpdateTextureRegions(Mip, 1, Region, MipSize * sizeof(FColor), sizeof(FColor), (uint8*)MipData[Mip].GetData(),
+					[](uint8*, const FUpdateTextureRegion2D* Regions) { delete Regions; });
+				if (Mip + 1 < Mips)
+				{
+					const int32 NW = W / 2, NH = H / 2;
+					TArray<FLinearColor> Smaller;
+					Smaller.SetNumUninitialized(NW * NH);
+					for (int32 Y = 0; Y < NH; ++Y)
+					{
+						for (int32 X = 0; X < NW; ++X)
+						{
+							Smaller[Y * NW + X] = (Level[(Y * 2) * W + X * 2] + Level[(Y * 2) * W + X * 2 + 1] + Level[(Y * 2 + 1) * W + X * 2] + Level[(Y * 2 + 1) * W + X * 2 + 1]) * 0.25f;
+						}
+					}
+					Level = MoveTemp(Smaller);
+					W = NW;
+					H = NH;
+				}
+			}
+		}
+
+		UTexture2D* Texture = nullptr;
+		TArray<FColor> MipData[Mips];
+		TMap<int32, FBox2f> Cells;
+		int32 NextSlot = 0;
+		bool bFull = false;
+	};
+
+	FHUDAtlas& HUDAtlas()
+	{
+		static FHUDAtlas Atlas;
+		return Atlas;
+	}
+
+	/** One quad from the atlas (corners clockwise from the top left), batched with the canvas's other atlas draws */
+	void AtlasQuad(UCanvas* Canvas, const FVector2D (&P)[4], const FVector2f (&UV)[4], const FLinearColor& Color)
+	{
+		const FTexture* Resource = HUDAtlas().Resource();
+		if (!Canvas || !Canvas->Canvas || !Resource)
+		{
+			return;
+		}
+		FCanvas* C = Canvas->Canvas;
+		FBatchedElements* Batch = C->GetBatchedElements(FCanvas::ET_Triangle, nullptr, Resource, SE_BLEND_Translucent);
+		const FHitProxyId HitProxy = C->GetHitProxyId();
+		FLinearColor Tint = Color;
+		Tint.A *= C->AlphaModulate;
+		int32 V[4];
+		for (int32 i = 0; i < 4; ++i)
+		{
+			V[i] = Batch->AddVertexf(FVector4f((float)P[i].X, (float)P[i].Y, 0.0f, 1.0f), UV[i], Tint, HitProxy);
+		}
+		Batch->AddTriangleExtensive(V[0], V[1], V[2], nullptr, Resource, SE_BLEND_Translucent);
+		Batch->AddTriangleExtensive(V[0], V[2], V[3], nullptr, Resource, SE_BLEND_Translucent);
+	}
+
+	/** An axis-aligned rectangle of a cell: U0..U1 and V0..V1 in the cell's own 0-1 space */
+	void AtlasRect(UCanvas* Canvas, const FBox2f& Cell, float X, float Y, float W, float H, float U0, float V0, float U1, float V1, const FLinearColor& Color)
+	{
+		const FVector2f CellSize = Cell.GetSize();
+		const FVector2f A(Cell.Min.X + U0 * CellSize.X, Cell.Min.Y + V0 * CellSize.Y), B(Cell.Min.X + U1 * CellSize.X, Cell.Min.Y + V1 * CellSize.Y);
+		const FVector2D P[4] = { FVector2D(X, Y), FVector2D(X + W, Y), FVector2D(X + W, Y + H), FVector2D(X, Y + H) };
+		const FVector2f UV[4] = { A, FVector2f(B.X, A.Y), B, FVector2f(A.X, B.Y) };
+		AtlasQuad(Canvas, P, UV, Color);
+	}
+
+	/** A whole cell over a rectangle turned AngleDeg about its centre, as a rotated canvas tile would draw it */
+	void AtlasRotated(UCanvas* Canvas, const FBox2f& Cell, const FVector2D& Center, const FVector2D& Size, float AngleDeg, const FLinearColor& Color)
+	{
+		float Sin = 0.0f, Cos = 1.0f;
+		FMath::SinCos(&Sin, &Cos, FMath::DegreesToRadians(AngleDeg));
+		const FVector2D Half = Size * 0.5f;
+		const FVector2D Corners[4] = { FVector2D(-Half.X, -Half.Y), FVector2D(Half.X, -Half.Y), FVector2D(Half.X, Half.Y), FVector2D(-Half.X, Half.Y) };
+		FVector2D P[4];
+		for (int32 i = 0; i < 4; ++i)
+		{
+			P[i] = Center + FVector2D(Corners[i].X * Cos - Corners[i].Y * Sin, Corners[i].X * Sin + Corners[i].Y * Cos);
+		}
+		const FVector2f UV[4] = { Cell.Min, FVector2f(Cell.Max.X, Cell.Min.Y), Cell.Max, FVector2f(Cell.Min.X, Cell.Max.Y) };
+		AtlasQuad(Canvas, P, UV, Color);
+	}
+
+	/** A point inside the atlas's white cell, for flat colour */
+	bool AtlasWhiteUV(FVector2f& OutUV)
+	{
+		FBox2f Cell;
+		if (!HUDAtlas().Cell(AtlasWhite, Cell))
+		{
+			return false;
+		}
+		OutUV = Cell.GetCenter();
+		return true;
+	}
+
+	/** Points flat-coloured triangles at the atlas's white cell, so they batch with the shapes; returns the texture to draw them with */
+	const FTexture* WhiteTriangles(TArray<FCanvasUVTri>& Tris)
+	{
+		FVector2f UV;
+		const FTexture* Resource = AtlasWhiteUV(UV) ? HUDAtlas().Resource() : nullptr;
+		if (!Resource)
+		{
+			return GWhiteTexture;
+		}
+		for (FCanvasUVTri& Tri : Tris)
+		{
+			Tri.V0_UV = Tri.V1_UV = Tri.V2_UV = FVector2D(UV);
+		}
+		return Resource;
+	}
+
+	/** ATDHUD::NineSlice from an atlas cell; false (nothing drawn) when the atlas can't take the cell */
+	bool NineSliceAtlas(UCanvas* Canvas, int32 Key, const FBox2D& Rect, float Corner, const FLinearColor& Color)
+	{
+		FBox2f Cell;
+		if (!Canvas || !HUDAtlas().Cell(Key, Cell))
+		{
+			return false;
+		}
+		const FBox2D Box = Snap(Rect);
+		const float MinX = (float)Box.Min.X;
+		const float MinY = (float)Box.Min.Y;
+		const float MaxX = (float)Box.Max.X;
+		const float MaxY = (float)Box.Max.Y;
+		const float SizeX = MaxX - MinX;
+		const float SizeY = MaxY - MinY;
+		if (SizeX < 1.0f || SizeY < 1.0f)
+		{
+			return true;
+		}
+		const float C = FMath::Max(0.0f, FMath::Min(FMath::RoundToFloat(Corner), FMath::FloorToFloat(FMath::Min(SizeX, SizeY) * 0.5f)));
+		const float U = ShapeCorner / ShapeSize;
+		const float Xs[4] = { MinX, MinX + C, MaxX - C, MaxX };
+		const float Ys[4] = { MinY, MinY + C, MaxY - C, MaxY };
+		const float Us[4] = { 0.0f, U, 1.0f - U, 1.0f };
+		for (int32 Row = 0; Row < 3; ++Row)
+		{
+			for (int32 Col = 0; Col < 3; ++Col)
+			{
+				const float W = Xs[Col + 1] - Xs[Col];
+				const float H = Ys[Row + 1] - Ys[Row];
+				if (W <= 0.0f || H <= 0.0f)
+				{
+					continue;
+				}
+				AtlasRect(Canvas, Cell, Xs[Col], Ys[Row], W, H, Us[Col], Us[Row], Us[Col + 1], Us[Row + 1], Color);
+			}
+		}
+		return true;
+	}
+
 	/** Repeatable pseudo-random number in [0, 1) for decoration layout */
 	float Hash01(int32 I, int32 K)
 	{
@@ -379,6 +1054,8 @@ bool ATDHUD::HandleClick(const FVector2D& ScreenPos)
 		case EButton::ToggleShowFps:	GameMode->SetShowFps(!GameMode->IsShowingFps()); break;
 		case EButton::ToggleVSync:		GameMode->SetVSync(!GameMode->IsVSyncEnabled()); break;
 		case EButton::ToggleAA:			GameMode->SetSharpAA(!GameMode->IsSharpAA()); break;
+		case EButton::ToggleHDIcons:	GameMode->SetHDIcons(!GameMode->IsHDIcons()); break;
+		case EButton::ToggleHDInterface:	GameMode->SetHDInterface(!GameMode->IsHDInterface()); break;
 
 		case EButton::MenuControls:		GameMode->OpenControls(); break;
 		case EButton::BindKey:			GameMode->StartRebinding(Btn.Param); break;
@@ -487,6 +1164,16 @@ bool ATDHUD::HandleRightClick(const FVector2D& ScreenPos)
 void ATDHUD::Fill(const FBox2D& Rect, const FLinearColor& Color)
 {
 	const FBox2D Box = Snap(Rect);
+	FBox2f White;
+	if (Canvas && HUDAtlas().Cell(AtlasWhite, White))
+	{
+		// the middle of the white cell: flat colour, batched with the shapes
+		const FVector2f Mid = White.GetCenter();
+		const FVector2D P[4] = { Box.Min, FVector2D(Box.Max.X, Box.Min.Y), Box.Max, FVector2D(Box.Min.X, Box.Max.Y) };
+		const FVector2f UV[4] = { Mid, Mid, Mid, Mid };
+		AtlasQuad(Canvas, P, UV, Color);
+		return;
+	}
 	DrawRect(Color, Box.Min.X, Box.Min.Y, Box.GetSize().X, Box.GetSize().Y);
 }
 
@@ -529,7 +1216,10 @@ void ATDHUD::NineSlice(UTexture2D* Texture, const FBox2D& Rect, float Corner, co
 
 void ATDHUD::RoundFill(const FBox2D& Rect, const FLinearColor& Color, float Radius)
 {
-	NineSlice(ShapeTexture(EShape::Fill), Rect, Radius, Color);
+	if (!NineSliceAtlas(Canvas, AtlasFill, Rect, Radius, Color))
+	{
+		NineSlice(ShapeTexture(EShape::Fill), Rect, Radius, Color);
+	}
 }
 
 void ATDHUD::RoundFrame(const FBox2D& Rect, const FLinearColor& Color, float Radius, float Thickness)
@@ -539,13 +1229,68 @@ void ATDHUD::RoundFrame(const FBox2D& Rect, const FLinearColor& Color, float Rad
 	const float C = FMath::Max(1.0f, FMath::Min(FMath::RoundToFloat(Radius), FMath::FloorToFloat(Shorter * 0.5f)));
 	const float T = FMath::Max(1.0f, FMath::RoundToFloat(Thickness));
 	// the outline width in texels that lands on T pixels at this corner size
-	NineSlice(ShapeTexture(EShape::Ring, T * ShapeCorner / C), Rect, C, Color);
+	if (!NineSliceAtlas(Canvas, AtlasRingBase + RingWidthKey(T * ShapeCorner / C), Rect, C, Color))
+	{
+		NineSlice(ShapeTexture(EShape::Ring, T * ShapeCorner / C), Rect, C, Color);
+	}
+}
+
+void ATDHUD::NacreRim(const FBox2D& Rect, const FLinearColor& Edge, float Radius, float Width, float Alpha)
+{
+	const FVector2D Size = Snap(Rect).GetSize();
+	const float C = FMath::Max(1.0f, FMath::Min(FMath::RoundToFloat(Radius), FMath::FloorToFloat((float)FMath::Min(Size.X, Size.Y) * 0.5f)));
+	// a faint dark line just outside, so the rim stands off whatever is behind the panel
+	RoundFrame(Rect.ExpandBy(FMath::Max(1.0f, UIScale)), FLinearColor(0.0f, 0.0f, 0.0f, 0.3f * Alpha), C + UIScale, FMath::Max(1.0f, UIScale));
+	const FLinearColor Tint = FMath::Lerp(FLinearColor(Edge.R, Edge.G, Edge.B, 1.0f), FLinearColor::White, 0.42f);
+	if (!NineSliceAtlas(Canvas, AtlasRimBase + RimWidthKey(Width * ShapeCorner / C), Rect, C, FLinearColor(Tint.R, Tint.G, Tint.B, Alpha)))
+	{
+		NineSlice(RimTexture(Width * ShapeCorner / C), Rect, C, FLinearColor(Tint.R, Tint.G, Tint.B, Alpha));
+	}
+}
+
+void ATDHUD::DetailedCardEdge(const FBox2D& Rect, const FLinearColor& Edge, float Radius, float Alpha)
+{
+	InnerLip(Rect, Radius, 3.0f * UIScale, 0.3f * Alpha);
+	NacreRim(Rect, Edge, Radius, 1.8f * UIScale, Alpha);
+}
+
+void ATDHUD::InnerLip(const FBox2D& Rect, float Radius, float Width, float Strength)
+{
+	const FVector2D Size = Snap(Rect).GetSize();
+	const float C = FMath::Max(1.0f, FMath::Min(FMath::RoundToFloat(Radius), FMath::FloorToFloat((float)FMath::Min(Size.X, Size.Y) * 0.5f)));
+	if (!NineSliceAtlas(Canvas, AtlasLipBase + LipWidthKey(Width * ShapeCorner / C), Rect, C, FLinearColor(1.0f, 1.0f, 1.0f, Strength)))
+	{
+		NineSlice(LipTexture(Width * ShapeCorner / C), Rect, C, FLinearColor(1.0f, 1.0f, 1.0f, Strength));
+	}
+}
+
+void ATDHUD::Pearl(const FVector2D& Center, float Radius, const FLinearColor& Tint)
+{
+	if (!Canvas || Radius < 0.5f)
+	{
+		return;
+	}
+	FBox2f Cell;
+	if (HUDAtlas().Cell(AtlasPearl, Cell))
+	{
+		AtlasRect(Canvas, Cell, Center.X - Radius, Center.Y - Radius, Radius * 2.0f, Radius * 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, Tint);
+		return;
+	}
+	UTexture2D* Texture = PearlTexture();
+	if (!Texture)
+	{
+		return;
+	}
+	DrawTexture(Texture, Center.X - Radius, Center.Y - Radius, Radius * 2.0f, Radius * 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, Tint, BLEND_Translucent);
 }
 
 void ATDHUD::Glow(const FBox2D& Rect, const FLinearColor& Color, float Radius, float Spread)
 {
 	const FBox2D Outer = Rect.ExpandBy(Spread);
-	NineSlice(ShapeTexture(EShape::Glow), Outer, FMath::Max(Spread * 2.0f, Radius + Spread), Color);
+	if (!NineSliceAtlas(Canvas, AtlasGlow, Outer, FMath::Max(Spread * 2.0f, Radius + Spread), Color))
+	{
+		NineSlice(ShapeTexture(EShape::Glow), Outer, FMath::Max(Spread * 2.0f, Radius + Spread), Color);
+	}
 }
 
 void ATDHUD::Panel(const FBox2D& Rect, const FLinearColor& Color, bool bBlocksMouse)
@@ -573,6 +1318,12 @@ void ATDHUD::Panel(const FBox2D& Rect, const FLinearColor& Color, bool bBlocksMo
 			const float C = FMath::Min(FMath::RoundToFloat(R), FMath::FloorToFloat((float)FMath::Min(Sheen.GetSize().X, Sheen.GetSize().Y) * 0.5f));
 			WaveStrip((float)Sheen.Min.X + C, (float)Sheen.Max.X - C, (float)Sheen.Max.Y, RippleH, true, SheenColor, (float)FMath::Fmod(Now() * 0.015, 1.0));
 		}
+		if (DetailedUI())
+		{
+			// the glass's lit inner lip and a thin nacre rim (framed panels draw a slightly wider one over it)
+			InnerLip(Rect, R, 3.5f * UIScale, 0.35f);
+			NacreRim(Rect, PanelEdge, R, 1.8f * UIScale);
+		}
 	}
 	if (bBlocksMouse)
 	{
@@ -587,27 +1338,75 @@ void ATDHUD::FramedPanel(const FBox2D& Rect, const FLinearColor& Edge)
 	Panel(Rect, PanelColor);
 	// the panel's own colour washes faintly up from the bottom (no accent bar on top: the user removed it)
 	RoundFill(FBox2D(FVector2D(Rect.Min.X, Rect.Max.Y - FMath::Min((float)Rect.GetSize().Y, 110.0f * S)), Rect.Max), WithAlpha(Edge, 0.1f), R);
-	RoundFrame(Rect, WithAlpha(Edge, FMath::Max(0.7f, FMath::Min(Edge.A, 0.85f))), R, 2.0f * S);
+	if (DetailedUI())
+	{
+		// a nacre rim and light caught just inside the edge (no corner pearls: the user removed them)
+		NacreRim(Rect, Edge, R, 2.4f * S);
+		RoundFrame(Rect.ExpandBy(-3.0f * S), WithAlpha(FMath::Lerp(Edge, FLinearColor::White, 0.3f), 0.06f), FMath::Max(1.0f, R - 3.0f * S), 6.0f * S);
+	}
+	else
+	{
+		RoundFrame(Rect, WithAlpha(Edge, FMath::Max(0.7f, FMath::Min(Edge.A, 0.85f))), R, 2.0f * S);
+	}
 	PanelDecor(Rect, Edge);
 }
 
 void ATDHUD::WaveStrip(float X0, float X1, float Y, float Height, bool bFilled, const FLinearColor& Color, float Phase)
 {
-	UTexture2D* Texture = WaveTexture(bFilled);
-	if (!Texture || !Canvas || X1 - X0 < 1.0f || Height < 1.0f)
+	if (!Canvas || X1 - X0 < 1.0f || Height < 1.0f)
 	{
 		return;
 	}
 	// texels stay square, so the wave keeps its shape at every interface size
 	const float TexelPx = Height / WaveH;
 	const float Width = X1 - X0;
+	FBox2f Cell;
+	if (HUDAtlas().Cell(bFilled ? AtlasWaveFilled : AtlasWaveLine, Cell))
+	{
+		// the atlas can't wrap, so one quad per period: each runs from U to the end of its period (or the strip)
+		const float PeriodPx = TexelPx * WaveW;
+		float X = X0;
+		float U = FMath::Frac(Phase);
+		while (X1 - X > 0.01f)
+		{
+			const float Px = FMath::Min((1.0f - U) * PeriodPx, X1 - X);
+			const float U1 = U + Px / PeriodPx;
+			AtlasRect(Canvas, Cell, X, Y, Px, Height, U, 0.0f, U1, 1.0f, Color);
+			X += Px;
+			U = 0.0f;
+		}
+		return;
+	}
+	UTexture2D* Texture = WaveTexture(bFilled);
+	if (!Texture)
+	{
+		return;
+	}
 	DrawTexture(Texture, X0, Y, Width, Height, Phase, 0.0f, Width / (TexelPx * WaveW), 1.0f, Color, BLEND_Translucent);
 }
 
 void ATDHUD::Blob(const FVector2D& Center, const FVector2D& Size, float AngleDeg, const FLinearColor& Color, bool bSoft)
 {
+	if (!Canvas || Size.X < 0.5f || Size.Y < 0.5f)
+	{
+		return;
+	}
+	FBox2f Cell;
+	if (HUDAtlas().Cell(bSoft ? AtlasGlow : AtlasFill, Cell))
+	{
+		// turned by hand rather than by the canvas, whose transform would start a new draw for every turned blob
+		if (AngleDeg == 0.0f)
+		{
+			AtlasRect(Canvas, Cell, Center.X - Size.X * 0.5f, Center.Y - Size.Y * 0.5f, Size.X, Size.Y, 0.0f, 0.0f, 1.0f, 1.0f, Color);
+		}
+		else
+		{
+			AtlasRotated(Canvas, Cell, Center, Size, AngleDeg, Color);
+		}
+		return;
+	}
 	UTexture2D* Texture = ShapeTexture(bSoft ? EShape::Glow : EShape::Fill);
-	if (!Texture || !Canvas || Size.X < 0.5f || Size.Y < 0.5f)
+	if (!Texture)
 	{
 		return;
 	}
@@ -621,6 +1420,23 @@ void ATDHUD::Bubble(const FVector2D& Center, float Radius, const FLinearColor& T
 	{
 		return;
 	}
+	if (DetailedUI())
+	{
+		FBox2f Cell;
+		if (Canvas && HUDAtlas().Cell(AtlasBubble, Cell))
+		{
+			const FLinearColor Color = FMath::Lerp(FLinearColor::White, FLinearColor(Tint.R, Tint.G, Tint.B, 1.0f), 0.25f);
+			AtlasRect(Canvas, Cell, Center.X - Radius, Center.Y - Radius, Radius * 2.0f, Radius * 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, WithAlpha(Color, FMath::Min(Alpha, 1.0f)));
+			return;
+		}
+		if (UTexture2D* Texture = BubbleTexture())
+		{
+			// the painted bubble, tinted only slightly toward the caller's colour
+			const FLinearColor Color = FMath::Lerp(FLinearColor::White, FLinearColor(Tint.R, Tint.G, Tint.B, 1.0f), 0.25f);
+			DrawTexture(Texture, Center.X - Radius, Center.Y - Radius, Radius * 2.0f, Radius * 2.0f, 0.0f, 0.0f, 1.0f, 1.0f, WithAlpha(Color, FMath::Min(Alpha, 1.0f)), BLEND_Translucent);
+			return;
+		}
+	}
 	const FBox2D Box(Center - FVector2D(Radius, Radius), Center + FVector2D(Radius, Radius));
 	RoundFill(Box, WithAlpha(Tint, FMath::Min(0.1f * Alpha, 0.2f)), Radius);
 	RoundFrame(Box, WithAlpha(Tint, FMath::Min(0.45f * Alpha, 0.85f)), Radius, (Radius > 3.0f * UIScale ? 1.5f : 1.0f) * UIScale);
@@ -632,6 +1448,17 @@ void ATDHUD::Bubble(const FVector2D& Center, float Radius, const FLinearColor& T
 
 void ATDHUD::Starfish(const FVector2D& Center, float Radius, float AngleDeg, const FLinearColor& Color)
 {
+	if (DetailedUI())
+	{
+		if (UTexture2D* Texture = TDIcons::Decor(ETDDecorIcon::Starfish))
+		{
+			// the painted sea star fills about 0.86 of its tile
+			const float Size = Radius * 2.3f;
+			DrawTexture(Texture, Center.X - Size * 0.5f, Center.Y - Size * 0.5f, Size, Size, 0.0f, 0.0f, 1.0f, 1.0f, FLinearColor(1.0f, 1.0f, 1.0f, Color.A), BLEND_Translucent,
+				1.0f, false, AngleDeg, FVector2D(0.5f, 0.5f));
+			return;
+		}
+	}
 	for (int32 i = 0; i < 5; ++i)
 	{
 		const float Deg = AngleDeg + 72.0f * i;
@@ -643,6 +1470,17 @@ void ATDHUD::Starfish(const FVector2D& Center, float Radius, float AngleDeg, con
 
 void ATDHUD::Scallop(const FVector2D& Center, float Radius, const FLinearColor& Color)
 {
+	if (DetailedUI())
+	{
+		if (UTexture2D* Texture = TDIcons::Decor(ETDDecorIcon::Scallop))
+		{
+			// the painted shell is wider than tall and fills its tile's width; centred where the plain one's ribs are
+			const float Size = Radius * 2.0f;
+			const FVector2D Mid = Center - FVector2D(0.0f, Radius * 0.42f);
+			DrawTexture(Texture, Mid.X - Size * 0.5f, Mid.Y - Size * 0.5f, Size, Size, 0.0f, 0.0f, 1.0f, 1.0f, FLinearColor(1.0f, 1.0f, 1.0f, Color.A), BLEND_Translucent);
+			return;
+		}
+	}
 	// ribs fanning up from the hinge, a faint body behind them and the hinge's little ears
 	Blob(Center - FVector2D(0.0f, Radius * 0.5f), FVector2D(Radius * 1.7f, Radius * 1.1f), 0.0f, WithAlpha(Color, Color.A * 0.35f));
 	for (int32 i = 0; i < 5; ++i)
@@ -656,6 +1494,16 @@ void ATDHUD::Scallop(const FVector2D& Center, float Radius, const FLinearColor& 
 
 void ATDHUD::CoralSprig(const FVector2D& Base, float Height, const FLinearColor& Color)
 {
+	if (DetailedUI())
+	{
+		if (UTexture2D* Texture = TDIcons::Decor(ETDDecorIcon::Coral))
+		{
+			// the painted sprig is taller than wide, so its height spans 0.86 of the tile and its foot sits at 0.93
+			const float Size = Height * 1.25f / 0.86f;
+			DrawTexture(Texture, Base.X - Size * 0.5f, Base.Y - Size * 0.93f, Size, Size, 0.0f, 0.0f, 1.0f, 1.0f, FLinearColor(1.0f, 1.0f, 1.0f, Color.A), BLEND_Translucent);
+			return;
+		}
+	}
 	// a stem with two side branches, each ending in a round tip
 	const float Thick = FMath::Max(1.5f, Height * 0.16f);
 	auto Branch = [this, Thick, &Color](const FVector2D& From, float Deg, float Len)
@@ -809,7 +1657,19 @@ void ATDHUD::PanelDecor(const FBox2D& Rect, const FLinearColor& Tint)
 	// bottom-right corner, where a few bubbles rise from its end
 	const bool bBubbles = Height >= 150.0f * S;
 	const bool bCorals = Height >= 260.0f * S && Rect.GetSize().X >= 240.0f * S;
-	WaveStrip(Rect.Min.X + R + (bCorals ? 24.0f * S : 0.0f), Rect.Max.X - R - (bBubbles ? 30.0f * S : 0.0f), Rect.Max.Y - 15.0f * S, 13.0f * S, false, WithAlpha(Tint, 0.3f), (float)FMath::Fmod(Now() * 0.02, 1.0));
+	const bool bDetailed = DetailedUI();
+	{
+		// the detailed look draws a finer line with a pale crest above it
+		const float StripH = (bDetailed ? 8.0f : 13.0f) * S;
+		const float WaveX0 = Rect.Min.X + R + (bCorals ? (bDetailed ? 36.0f : 24.0f) * S : 0.0f);
+		const float WaveX1 = Rect.Max.X - R - (bBubbles ? 30.0f * S : 0.0f);
+		const float Drift = (float)FMath::Fmod(Now() * 0.02, 1.0);
+		WaveStrip(WaveX0, WaveX1, Rect.Max.Y - (bDetailed ? 12.0f : 15.0f) * S, StripH, false, WithAlpha(Tint, bDetailed ? 0.32f : 0.3f), Drift);
+		if (bDetailed)
+		{
+			WaveStrip(WaveX0, WaveX1, Rect.Max.Y - 12.0f * S - FMath::Max(1.0f, S), StripH, false, FLinearColor(0.85f, 1.0f, 1.0f, 0.12f), Drift);
+		}
+	}
 
 	// a starfish resting on the bottom-left corner of tall panels and a scallop beside it on the rim, both straddling
 	// the frame so they never cover the panel's content
@@ -818,6 +1678,11 @@ void ATDHUD::PanelDecor(const FBox2D& Rect, const FLinearColor& Tint)
 		const float Sway = (float)FMath::Sin(Now() * 0.22 + Rect.Min.X * 0.01) * 5.0f;
 		Starfish(FVector2D(Rect.Min.X + 5.0f * S, Rect.Max.Y - 3.0f * S), 9.0f * S, -14.0f + Sway, FLinearColor(1.0f, 0.5f, 0.34f, 0.92f));
 		Scallop(FVector2D(Rect.Min.X + 22.0f * S, Rect.Max.Y + 4.0f * S), 7.0f * S, FLinearColor(1.0f, 0.78f, 0.58f, 0.9f));
+		if (bDetailed)
+		{
+			// a coral sprig growing up beside them, as in the painted preview
+			CoralSprig(FVector2D(Rect.Min.X + 34.0f * S, Rect.Max.Y + 1.0f * S), 15.0f * S, FLinearColor(1.0f, 0.45f, 0.55f, 0.95f));
+		}
 	}
 
 	// three small bubbles in the bottom padding, clear of the content above it
@@ -831,6 +1696,11 @@ void ATDHUD::PanelDecor(const FBox2D& Rect, const FLinearColor& Tint)
 	{
 		const float Radius = Bubble.Diameter * 0.5f * S;
 		const FVector2D Center(Rect.Max.X - Bubble.X * S, Rect.Max.Y - Bubble.Y * S);
+		if (bDetailed)
+		{
+			ATDHUD::Bubble(Center, Radius * 1.15f, Tint, 0.95f);
+			continue;
+		}
 		const FBox2D Box(Center - FVector2D(Radius, Radius), Center + FVector2D(Radius, Radius));
 		RoundFill(Box, WithAlpha(Tint, 0.1f), Radius);
 		RoundFrame(Box, WithAlpha(Tint, 0.5f), Radius, 1.5f * S);
@@ -843,6 +1713,11 @@ void ATDHUD::DrawSeaBackdrop(float Strength)
 {
 	if (!Canvas)
 	{
+		return;
+	}
+	if (DetailedUI())
+	{
+		DrawSeaBackdropDetailed(Strength);
 		return;
 	}
 	// everything moves on periods of tens of seconds, and stays dim, so it reads as a picture and not as motion
@@ -937,15 +1812,244 @@ void ATDHUD::DrawSeaBackdrop(float Strength)
 	}
 }
 
+void ATDHUD::DrawSeaBackdropDetailed(float Strength)
+{
+	// the same slow scene as the plain backdrop, painted with more depth: everything still moves on periods of tens of seconds
+	const float W = Canvas->ClipX;
+	const float H = Canvas->ClipY;
+	const float S = UIScale;
+	const double T = Now();
+
+	// light shafts from the surface: a broad soft beam with a brighter core, leaning and breathing slowly
+	for (int32 i = 0; i < 7; ++i)
+	{
+		const float Seed = i * 1.37f;
+		const float X = W * (0.06f + 0.145f * i) + (float)FMath::Sin(T * 0.07 + Seed) * 40.0f * S;
+		const float Angle = 19.0f + 4.0f * (float)FMath::Sin(T * 0.05 + Seed * 2.0f);
+		const float BeamW = (80.0f + 70.0f * Hash01(i, 1)) * S;
+		const float Pulse = 0.5f + 0.5f * (float)FMath::Sin(T * 0.11 + Seed * 4.0f);
+		Blob(FVector2D(X, H * 0.15f), FVector2D(BeamW, H * 1.5f), Angle, FLinearColor(0.45f, 0.85f, 1.0f, (0.025f + 0.025f * Pulse) * Strength), true);
+		Blob(FVector2D(X + 6.0f * S, H * 0.1f), FVector2D(BeamW * 0.3f, H * 1.3f), Angle, FLinearColor(0.7f, 0.95f, 1.0f, (0.02f + 0.03f * Pulse) * Strength), true);
+	}
+
+	// marine snow: tiny pale specks sinking and drifting
+	for (int32 i = 0; i < 60; ++i)
+	{
+		const float Span = H + 20.0f * S;
+		const float Fall = (6.0f + 8.0f * Hash01(i, 21)) * S;
+		const float Y = (float)FMath::Fmod(T * Fall + Hash01(i, 22) * Span, (double)Span) - 10.0f * S;
+		const float X = Hash01(i, 23) * W + (float)FMath::Sin(T * 0.3 + i * 1.7) * 8.0f * S;
+		const float D = (1.2f + 1.6f * Hash01(i, 24)) * S;
+		Blob(FVector2D(X, Y), FVector2D(D, D), 0.0f, FLinearColor(0.8f, 0.95f, 1.0f, (0.12f + 0.14f * Hash01(i, 25)) * Strength));
+	}
+
+	// schools of fish far away, with pale bellies and flicking tails
+	for (int32 School = 0; School < 3; ++School)
+	{
+		const float Dir = School == 1 ? -1.0f : 1.0f;
+		const float FishScale = (School == 0 ? 1.0f : (School == 1 ? 0.75f : 0.6f)) * S;
+		const float Travel = W + 400.0f * S;
+		const float Speed = (School == 0 ? 22.0f : (School == 1 ? 15.0f : 11.0f)) * S;
+		const float Lead = (float)FMath::Fmod(T * Speed + School * Travel * 0.37f, (double)Travel) - 200.0f * S;
+		const float LeadX = Dir > 0.0f ? Lead : W - Lead;
+		const float BaseY = H * (School == 0 ? 0.3f : (School == 1 ? 0.18f : 0.42f)) + (float)FMath::Sin(T * 0.13 + School) * 20.0f * S;
+		const FLinearColor Back(0.02f, 0.1f, 0.14f, 0.55f * Strength);
+		const FLinearColor Belly(0.3f, 0.5f, 0.55f, 0.4f * Strength);
+		const int32 FishCount = School == 2 ? 9 : 7;
+		for (int32 i = 0; i < FishCount; ++i)
+		{
+			const FVector2D Pos(LeadX - Dir * (20.0f + 24.0f * i + 14.0f * Hash01(i, School + 3)) * FishScale,
+				BaseY + (Hash01(i, School + 7) - 0.5f) * 56.0f * FishScale + (float)FMath::Sin(T * 0.8 + i * 1.9) * 3.0f * FishScale);
+			const float Wiggle = (float)FMath::Sin(T * 3.0 + i * 2.3) * 14.0f;
+			const FVector2D Tail = Pos - FVector2D(Dir * 10.0f * FishScale, 0.0f);
+			Blob(Tail + FVector2D(0.0f, -2.0f * FishScale), FVector2D(7.0f, 3.0f) * FishScale, Dir * (-30.0f + Wiggle), Back);
+			Blob(Tail + FVector2D(0.0f, 2.0f * FishScale), FVector2D(7.0f, 3.0f) * FishScale, Dir * (30.0f + Wiggle), Back);
+			Blob(Pos, FVector2D(19.0f, 7.0f) * FishScale, 0.0f, Back);
+			Blob(Pos + FVector2D(Dir * 1.0f, 1.6f) * FishScale, FVector2D(14.0f, 3.0f) * FishScale, 0.0f, Belly);
+			Blob(Pos + FVector2D(Dir * 6.0f, -0.8f) * FishScale, FVector2D(1.6f, 1.6f) * FishScale, 0.0f, FLinearColor(0.75f, 0.9f, 0.95f, 0.5f * Strength));
+		}
+	}
+
+	// reef ridges along the bottom: a paler far line and a darker near one, soft-edged so they read as depth, not shapes
+	struct FRidge { float X; float Height; float Width; };
+	static const FRidge FarRidges[] = { { 0.0f, 0.2f, 0.22f }, { 0.16f, 0.14f, 0.2f }, { 0.34f, 0.18f, 0.24f }, { 0.52f, 0.12f, 0.2f }, { 0.68f, 0.19f, 0.22f }, { 0.86f, 0.15f, 0.2f }, { 1.0f, 0.21f, 0.2f } };
+	for (const FRidge& Ridge : FarRidges)
+	{
+		Blob(FVector2D(W * Ridge.X, H * 1.0f), FVector2D(W * Ridge.Width * 1.4f, H * Ridge.Height * 2.0f), 0.0f, FLinearColor(0.02f, 0.13f, 0.17f, 0.5f * Strength), true);
+	}
+	static const FRidge NearRidges[] = { { 0.06f, 0.12f, 0.2f }, { 0.28f, 0.08f, 0.22f }, { 0.5f, 0.1f, 0.18f }, { 0.74f, 0.07f, 0.22f }, { 0.95f, 0.13f, 0.2f } };
+	for (const FRidge& Ridge : NearRidges)
+	{
+		Blob(FVector2D(W * Ridge.X, H * 1.02f), FVector2D(W * Ridge.Width * 1.3f, H * Ridge.Height * 2.0f), 0.0f, FLinearColor(0.004f, 0.05f, 0.07f, 0.7f * Strength), true);
+	}
+
+	// kelp swaying in the bottom corners: a dark stalk with a lit edge, leaves with a pale midrib
+	struct FKelp { float X; float Height; float Phase; };
+	static const FKelp Kelp[] = { { 0.02f, 0.4f, 0.0f }, { 0.055f, 0.27f, 1.7f }, { 0.09f, 0.34f, 3.1f }, { 0.125f, 0.22f, 5.2f },
+		{ 0.88f, 0.25f, 0.9f }, { 0.915f, 0.31f, 4.6f }, { 0.945f, 0.42f, 2.4f }, { 0.98f, 0.26f, 4.0f } };
+	const FLinearColor StalkC(0.04f, 0.27f, 0.13f, 0.85f * Strength);
+	const FLinearColor LeafC(0.06f, 0.36f, 0.16f, 0.8f * Strength);
+	const FLinearColor LitC(0.35f, 0.75f, 0.45f, 0.35f * Strength);
+	for (const FKelp& Stalk : Kelp)
+	{
+		constexpr int32 Segments = 18;
+		const float StalkH = Stalk.Height * H;
+		const float SegLen = StalkH / Segments;
+		auto PointAt = [&](float F)
+		{
+			const float Sway = (float)FMath::Sin(T * 0.35 + Stalk.Phase + F * 2.2f) * F * F * 30.0f * S;
+			return FVector2D(Stalk.X * W + Sway, H + 8.0f * S - F * StalkH);
+		};
+		for (int32 Seg = 0; Seg < Segments; ++Seg)
+		{
+			const float F0 = (float)Seg / Segments;
+			const FVector2D A = PointAt(F0);
+			const FVector2D B = PointAt(F0 + 1.0f / Segments);
+			const FVector2D Mid = (A + B) * 0.5f;
+			const float Angle = FMath::RadiansToDegrees(FMath::Atan2((float)(B.X - A.X), (float)(A.Y - B.Y)));
+			const float Thick = FMath::Lerp(8.0f, 3.5f, F0) * S;
+			Blob(Mid, FVector2D(Thick, SegLen * 1.5f), Angle, StalkC);
+			Blob(Mid - FVector2D(Thick * 0.22f, 0.0f), FVector2D(Thick * 0.3f, SegLen * 1.3f), Angle, LitC);
+			// a leaf every few segments, alternating sides, each with a pale midrib
+			if (Seg % 3 == 1)
+			{
+				const float Side = (Seg / 3) % 2 == 0 ? 1.0f : -1.0f;
+				const float LeafLen = FMath::Lerp(36.0f, 18.0f, F0) * S;
+				const float LeafAngle = Angle + Side * (36.0f + 6.0f * (float)FMath::Sin(T * 0.5 + Stalk.Phase + Seg));
+				const FVector2D Out(FMath::Sin(FMath::DegreesToRadians(LeafAngle)), -FMath::Cos(FMath::DegreesToRadians(LeafAngle)));
+				Blob(Mid + Out * LeafLen * 0.5f, FVector2D(LeafLen * 0.34f, LeafLen), LeafAngle, LeafC);
+				Blob(Mid + Out * LeafLen * 0.48f, FVector2D(FMath::Max(1.0f, LeafLen * 0.05f), LeafLen * 0.8f), LeafAngle, LitC);
+			}
+		}
+	}
+
+	// bubbles drifting up in loose strings, fading toward the surface
+	for (int32 i = 0; i < 30; ++i)
+	{
+		const float Speed = (14.0f + 22.0f * Hash01(i, 2)) * S;
+		const float Span = H + 40.0f * S;
+		const float Age = (float)FMath::Fmod(T * Speed + Hash01(i, 3) * Span, (double)Span);
+		const float Y = H + 20.0f * S - Age;
+		const float X = Hash01(i / 3, 1) * W + (i % 3) * 6.0f * S + (float)FMath::Sin(T * 0.6 + i) * 10.0f * S * Hash01(i, 4);
+		const float Radius = (1.8f + 3.6f * Hash01(i, 5)) * S;
+		const float Fade = FMath::Clamp(Y / (0.3f * H), 0.0f, 1.0f) * Strength;
+		Bubble(FVector2D(X, Y), Radius, FLinearColor(0.6f, 0.95f, 1.0f, 1.0f), 0.55f * Fade);
+	}
+}
+
+bool ATDHUD::IsDetailedUI()
+{
+	return DetailedUI();
+}
+
+UTexture2D* ATDHUD::MapThumbnailTexture(int32 Map)
+{
+	static TMap<int32, UTexture2D*> Cache;
+	if (UTexture2D** Found = Cache.Find(Map))
+	{
+		return *Found;
+	}
+	// the texture is square; each texel maps to a spot in the Cols x Rows board, and the draw stretches it back to the board's shape
+	TSet<FIntPoint> Rocks;
+	for (const FIntPoint& Rock : TD::MapRocks(Map))
+	{
+		Rocks.Add(Rock);
+	}
+	const FIntPoint Spawn = TD::MapSpawn(Map), Goal = TD::MapGoal(Map);
+	const FLinearColor Tint = TD::MapTint(Map);
+	constexpr int32 Size = 256;
+	UTexture2D* Texture = MakePaintedTexture(Size, [Map, &Rocks, Spawn, Goal, Tint](float X, float Y)
+	{
+		const float BX = X / Size * TD::Cols, BY = Y / Size * TD::Rows;
+		const FIntPoint C(FMath::FloorToInt(BX), FMath::FloorToInt(BY));
+		if (!TD::IsMapCell(Map, C))
+		{
+			return FLinearColor(0, 0, 0, 0);
+		}
+		const float FX = BX - C.X, FY = BY - C.Y;
+		// sand with soft ripples and grain, a faint checker, darker grout between the cells
+		const float Ripple = FMath::Sin((BX * 0.8f + BY * 1.3f) * 6.0f + FMath::Sin(BX * 2.1f) * 1.5f) * 0.5f + 0.5f;
+		const float Grain = Hash01(FMath::FloorToInt(X * 2.0f), FMath::FloorToInt(Y * 2.0f));
+		float Light = 0.92f + 0.08f * Ripple + 0.06f * (Grain - 0.5f) + ((C.X + C.Y) % 2 == 0 ? 0.0f : 0.04f);
+		const float Edge = FMath::Min(FMath::Min(FX, 1.0f - FX), FMath::Min(FY, 1.0f - FY));
+		Light *= 0.82f + 0.18f * SmoothStep01(0.0f, 0.08f, Edge);
+		// a lit top-left bevel on every tile
+		Light *= 1.0f + 0.08f * SmoothStep01(0.12f, 0.0f, FMath::Min(FX, FY));
+		// the board's outer edge falls away into shadow
+		const bool bLeft = !TD::IsMapCell(Map, C - FIntPoint(1, 0)), bRight = !TD::IsMapCell(Map, C + FIntPoint(1, 0));
+		const bool bUp = !TD::IsMapCell(Map, C - FIntPoint(0, 1)), bDown = !TD::IsMapCell(Map, C + FIntPoint(0, 1));
+		const float Outer = FMath::Min(FMath::Min(bLeft ? FX : 1.0f, bRight ? 1.0f - FX : 1.0f), FMath::Min(bUp ? FY : 1.0f, bDown ? 1.0f - FY : 1.0f));
+		Light *= 0.6f + 0.4f * SmoothStep01(0.0f, 0.18f, Outer);
+		FLinearColor Col(0.075f * Tint.R * Light, 0.14f * Tint.G * Light, 0.16f * Tint.B * Light, 1.0f);
+		if (Rocks.Contains(C))
+		{
+			// a rounded boulder, lit from the upper left, with a contact shadow on the sand
+			const FVector2f P(FX - 0.5f, FY - 0.52f);
+			const float R = 0.42f + 0.03f * FMath::Sin(FMath::Atan2(P.Y, P.X) * 3.0f + C.X);
+			const float D = P.Size();
+			Col *= 1.0f - 0.45f * SmoothStep01(0.5f, 0.32f, (P - FVector2f(-0.05f, -0.07f)).Size());
+			if (D < R)
+			{
+				const float Q = D / R;
+				const FVector3f N = FVector3f(P.X / R, P.Y / R, FMath::Sqrt(FMath::Max(0.0f, 1.0f - Q * Q))).GetSafeNormal();
+				const float Diffuse = FMath::Max(0.0f, FVector3f::DotProduct(N, LightDir));
+				const float Spec = FMath::Pow(FMath::Max(0.0f, FVector3f::DotProduct(N, (LightDir + FVector3f(0, 0, 1)).GetSafeNormal())), 20.0f) * 0.25f;
+				const float Speck = Hash01(FMath::FloorToInt(X * 3.0f), FMath::FloorToInt(Y * 3.0f)) * 0.1f;
+				const float V = 0.3f + 0.55f * Diffuse + Speck;
+				Col = FLinearColor(0.2f * V + Spec, 0.23f * V + Spec, 0.26f * V + Spec, 1.0f);
+				Col *= 1.0f - 0.5f * SmoothStep01(R - 0.04f, R, D);
+				Col.A = 1.0f;
+			}
+		}
+		// the trench (red glow) where creatures come from and the reef (green glow) they head for
+		const auto GlowAt = [BX, BY](const FIntPoint& At) { return FVector2f(BX - (At.X + 0.5f), BY - (At.Y + 0.5f)).Size(); };
+		const float SpawnD = GlowAt(Spawn), GoalD = GlowAt(Goal);
+		Col = FMath::Lerp(Col, FLinearColor(0.95f, 0.35f, 0.38f, 1.0f), SmoothStep01(1.1f, 0.2f, SpawnD) * 0.85f);
+		Col = FMath::Lerp(Col, FLinearColor(0.45f, 0.95f, 0.55f, 1.0f), SmoothStep01(1.1f, 0.2f, GoalD) * 0.85f);
+		const float Ring = FMath::Min(FMath::Abs(SpawnD - 0.55f), FMath::Abs(GoalD - 0.55f));
+		Col = FMath::Lerp(Col, FLinearColor::White, SmoothStep01(0.07f, 0.0f, Ring) * 0.5f);
+		Col.A = 1.0f;
+		return Col;
+	}, TEXT("TDHUDMapThumb"));
+	Cache.Add(Map, Texture);
+	return Texture;
+}
+
+void ATDHUD::GlassBar(const FBox2D& Rect, float Fraction, const FLinearColor& Color, bool bTicks)
+{
+	const float H = Rect.GetSize().Y;
+	const float R = H * 0.5f;
+	// a dark keyline round the empty tube
+	RoundFill(Rect.ExpandBy(1.0f), FLinearColor(0.0f, 0.0f, 0.0f, 0.72f), R + 1.0f);
+	if (Fraction > 0.0f)
+	{
+		const FBox2D Bar(Rect.Min, FVector2D(Rect.Min.X + FMath::Max(H, Rect.GetSize().X * FMath::Clamp(Fraction, 0.0f, 1.0f)), Rect.Max.Y));
+		RoundFill(Bar, Color, R);
+		// the lit top of the liquid: a pale streak inset from the ends
+		RoundFill(FBox2D(FVector2D(Bar.Min.X + R * 0.6f, Bar.Min.Y + FMath::Max(1.0f, H * 0.12f)), FVector2D(Bar.Max.X - R * 0.6f, Bar.Min.Y + H * 0.45f)),
+			FLinearColor(1.0f, 1.0f, 1.0f, 0.4f), H * 0.2f);
+	}
+	if (bTicks)
+	{
+		// quarter marks across the whole tube
+		for (int32 q = 1; q < 4; ++q)
+		{
+			const float X = FMath::RoundToFloat(Rect.Min.X + Rect.GetSize().X * q / 4.0f);
+			Fill(FBox2D(FVector2D(X, Rect.Min.Y + 1.0f), FVector2D(X + 1.0f, Rect.Max.Y - 1.0f)), FLinearColor(0.0f, 0.0f, 0.0f, 0.4f));
+		}
+	}
+}
+
 void ATDHUD::Frame(const FBox2D& Rect, const FLinearColor& Color, float Thickness)
 {
 	const FBox2D Box = Snap(Rect);
 	const FVector2D Size = Box.GetSize();
 	const float T = FMath::Max(1.0f, FMath::RoundToFloat(Thickness));
-	DrawRect(Color, Box.Min.X, Box.Min.Y, Size.X, T);
-	DrawRect(Color, Box.Min.X, Box.Max.Y - T, Size.X, T);
-	DrawRect(Color, Box.Min.X, Box.Min.Y + T, T, Size.Y - T * 2.0f);
-	DrawRect(Color, Box.Max.X - T, Box.Min.Y + T, T, Size.Y - T * 2.0f);
+	// Fill snaps to whole pixels again, which leaves these already whole edges unchanged
+	Fill(FBox2D(Box.Min, Box.Min + FVector2D(Size.X, T)), Color);
+	Fill(FBox2D(FVector2D(Box.Min.X, Box.Max.Y - T), FVector2D(Box.Min.X + Size.X, Box.Max.Y)), Color);
+	Fill(FBox2D(FVector2D(Box.Min.X, Box.Min.Y + T), FVector2D(Box.Min.X + T, Box.Max.Y - T)), Color);
+	Fill(FBox2D(FVector2D(Box.Max.X - T, Box.Min.Y + T), FVector2D(Box.Max.X, Box.Max.Y - T)), Color);
 }
 
 FVector2D ATDHUD::MeasureText(const FString& InText, float Size) const
@@ -973,8 +2077,17 @@ void ATDHUD::PanelHeader(UTexture2D* Texture, float X, float Y, float W, const F
 	const float IconSize = HeaderIcon * UIScale;
 	const float CenterY = Y + IconSize * 0.5f;
 	const FBox2D Plate(FVector2D(X, Y), FVector2D(X + IconSize, Y + IconSize));
-	RoundFill(Plate, InsetColor, IconSize * 0.5f);
-	RoundFrame(Plate, WithAlpha(TitleColor, 0.7f), IconSize * 0.5f, 1.5f * UIScale);
+	if (DetailedUI())
+	{
+		// a porthole: a dark glass window in a thin nacre ring
+		RoundFill(Plate, FLinearColor(0.003f, 0.035f, 0.06f, 0.85f), IconSize * 0.5f);
+		NacreRim(Plate, TitleColor, IconSize * 0.5f, 2.4f * UIScale);
+	}
+	else
+	{
+		RoundFill(Plate, InsetColor, IconSize * 0.5f);
+		RoundFrame(Plate, WithAlpha(TitleColor, 0.7f), IconSize * 0.5f, 1.5f * UIScale);
+	}
 	Icon(Texture, Plate.ExpandBy(-5.0f * UIScale));
 
 	const float NoteW = MeasureText(Note, SizeSmall).X;
@@ -1018,6 +2131,36 @@ void ATDHUD::Meter(const FBox2D& Rect, float Fraction, const FLinearColor& Color
 		RoundFill(Bar, Color, R);
 		// lighter top half for a glassy tube
 		RoundFill(FBox2D(Bar.Min + FVector2D(2.0f * UIScale, 1.0f * UIScale), FVector2D(Bar.Max.X - 2.0f * UIScale, Bar.Min.Y + Rect.GetSize().Y * 0.45f)), FLinearColor(1.0f, 1.0f, 1.0f, 0.12f), R * 0.5f);
+		if (DetailedUI() && Fraction < 0.995f)
+		{
+			// the liquid's meniscus: a bright edge where it ends
+			const float S = UIScale;
+			Fill(FBox2D(FVector2D(Bar.Max.X - 1.5f * S, Rect.Min.Y + 1.5f * S), FVector2D(Bar.Max.X, Rect.Max.Y - 1.5f * S)), FLinearColor(1.0f, 1.0f, 1.0f, 0.35f));
+		}
+		if (DetailedUI() && FillW > 40.0f * UIScale)
+		{
+			// a few tiny bubbles drifting up through the liquid
+			const float S = UIScale;
+			for (int32 i = 0; i < 3; ++i)
+			{
+				const float Rise = (float)FMath::Fmod(Now() * (0.25 + 0.1 * i) + Hash01(i, 31), 1.0);
+				const FVector2D P(Rect.Min.X + FillW * (0.2f + 0.28f * i), Rect.Max.Y - 2.0f * S - Rise * (Rect.GetSize().Y - 4.0f * S));
+				const float BR = (1.0f + 0.4f * i) * S;
+				RoundFrame(FBox2D(P - FVector2D(BR), P + FVector2D(BR)), FLinearColor(1.0f, 1.0f, 1.0f, 0.35f * (1.0f - Rise)), BR, FMath::Max(1.0f, 0.8f * S));
+			}
+		}
+	}
+	if (DetailedUI())
+	{
+		// a glass tube: tick marks at the quarters, a highlight along the top and a dark keyline
+		const float S = UIScale;
+		for (int32 q = 1; q < 4; ++q)
+		{
+			const float X = Rect.Min.X + Rect.GetSize().X * q / 4.0f;
+			Fill(FBox2D(FVector2D(X, Rect.Max.Y - Rect.GetSize().Y * 0.35f), FVector2D(X + FMath::Max(1.0f, S), Rect.Max.Y - 1.0f * S)), FLinearColor(0.0f, 0.0f, 0.0f, 0.3f));
+		}
+		RoundFill(FBox2D(Rect.Min + FVector2D(R * 0.6f, 1.0f * S), FVector2D(Rect.Max.X - R * 0.6f, Rect.Min.Y + FMath::Max(2.0f, Rect.GetSize().Y * 0.22f))), FLinearColor(1.0f, 1.0f, 1.0f, 0.1f), R * 0.3f);
+		RoundFrame(Rect.ExpandBy(FMath::Max(1.0f, S)), FLinearColor(0.0f, 0.0f, 0.0f, 0.4f), R + S, FMath::Max(1.0f, S));
 	}
 	RoundFrame(Rect, WithAlpha(PanelEdge, 0.12f), R, 1.0f);
 	const FVector2D Center = Rect.GetCenter();
@@ -1075,9 +2218,28 @@ void ATDHUD::Button(const FBox2D& Rect, const FString& Label, EButton Id, int32 
 	{
 		Glow(Rect, WithAlpha(IsLightFill(Base) ? Base : AccentColor, bHovered ? 0.4f : 0.28f), R, 10.0f * S);
 	}
+	const bool bDetailed = DetailedUI();
+	if (bDetailed)
+	{
+		// a dark keyline round the sea glass
+		RoundFrame(Rect.ExpandBy(FMath::Max(1.0f, S)), FLinearColor(0.0f, 0.0f, 0.0f, 0.45f), R + S, FMath::Max(1.0f, S));
+	}
 	RoundFill(Rect, Color, R);
-	// top sheen
-	RoundFill(FBox2D(Rect.Min, FVector2D(Rect.Max.X, Rect.Min.Y + Rect.GetSize().Y * 0.5f)), FLinearColor(1.0f, 1.0f, 1.0f, IsLightFill(Base) ? 0.16f : 0.07f), R);
+	if (bDetailed)
+	{
+		// sea glass: a soft gloss over the upper part, inset from the edge (a disabled button stays matte), and the lit inner lip
+		if (bEnabled)
+		{
+			const FBox2D Gloss(Rect.Min + FVector2D(2.0f * S, 2.0f * S), FVector2D(Rect.Max.X - 2.0f * S, Rect.Min.Y + Rect.GetSize().Y * 0.46f));
+			RoundFill(Gloss, FLinearColor(1.0f, 1.0f, 1.0f, IsLightFill(Base) ? 0.2f : 0.1f), FMath::Max(1.0f, R - 2.0f * S));
+		}
+		InnerLip(Rect, R, 3.0f * S, bEnabled ? 0.5f : 0.2f);
+	}
+	else
+	{
+		// top sheen
+		RoundFill(FBox2D(Rect.Min, FVector2D(Rect.Max.X, Rect.Min.Y + Rect.GetSize().Y * 0.5f)), FLinearColor(1.0f, 1.0f, 1.0f, IsLightFill(Base) ? 0.16f : 0.07f), R);
+	}
 	// a darker lip along the bottom gives the button some depth
 	RoundFill(FBox2D(FVector2D(Rect.Min.X, Rect.Max.Y - FMath::Max(2.0f, 3.0f * S)), Rect.Max), FLinearColor(0.0f, 0.0f, 0.0f, 0.22f), FMath::Min(R, 3.0f * S));
 	// a clickable button drawn in the disabled colour (an option that is off, like Auto-salvage) gets the disabled edge too
@@ -1120,7 +2282,14 @@ void ATDHUD::Switch(const FBox2D& Rect, bool bOn)
 	{
 		Glow(KnobRect, WithAlpha(AccentColor, 0.5f), Knob * 0.5f, 4.0f * UIScale);
 	}
-	RoundFill(KnobRect, bOn ? FLinearColor::White : DisabledText, Knob * 0.5f);
+	if (DetailedUI())
+	{
+		Pearl(KnobRect.GetCenter(), Knob * 0.5f, bOn ? FLinearColor::White : FLinearColor(0.45f, 0.55f, 0.6f, 1.0f));
+	}
+	else
+	{
+		RoundFill(KnobRect, bOn ? FLinearColor::White : DisabledText, Knob * 0.5f);
+	}
 }
 
 void ATDHUD::Icon(UTexture2D* Texture, const FBox2D& Rect, const FLinearColor& Tint)
@@ -1138,10 +2307,22 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 {
 	const float R = RadiusTile * UIScale;
 	const bool bHovered = Rect.IsInside(MousePos);
+	const bool bDetailed = DetailedUI();
+	const float TileW = (float)Rect.GetSize().X, TileH = (float)Rect.GetSize().Y;
 	if (!Item || !Item->IsValid())
 	{
 		RoundFill(Rect, InsetColor, R);
-		RoundFrame(Rect, WithAlpha(PanelEdge, 0.1f), R, 1.0f);
+		if (bDetailed)
+		{
+			// a recessed glass well: shadowed under its top edge, a faint cool light along its bottom
+			RoundFill(Rect, FLinearColor(0.0f, 0.02f, 0.035f, 0.25f), R);
+			Blob(FVector2D(Rect.GetCenter().X, Rect.Min.Y + TileH * 0.14f), FVector2D(TileW * 0.92f, TileH * 0.34f), 0.0f, FLinearColor(0.0f, 0.0f, 0.0f, 0.35f), true);
+			RoundFrame(Rect, FLinearColor(0.5f, 0.9f, 1.0f, 0.12f), R, 1.0f);
+		}
+		else
+		{
+			RoundFrame(Rect, WithAlpha(PanelEdge, 0.1f), R, 1.0f);
+		}
 		if (Id == EButton::EquippedItem)
 		{
 			// faded silhouette of the slot's item kind
@@ -1196,14 +2377,32 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 		{
 			Glow(Rect, WithAlpha(Color, 0.45f), R, 8.0f * UIScale);
 		}
-		RoundFill(Rect, InsetColor, R);
-		RoundFill(Rect.ExpandBy(-1.0f * UIScale), WithAlpha(Color * (bHovered ? 0.5f : 0.3f), 0.85f), R);
-		RoundFrame(Rect, WithAlpha(Color, bHovered ? 1.0f : 0.8f), R, 1.5f * UIScale);
+		if (bDetailed)
+		{
+			// a recessed well: dark at the rim, the rarity colour glowing up from the bottom like light through deep water, a soft
+			// bloom behind the icon and a shadow under the top edge; then a bevelled rim in the rarity colour
+			const float S = UIScale;
+			const FVector2D Mid = Rect.GetCenter();
+			RoundFill(Rect, FLinearColor(0.0f, 0.006f, 0.012f, 0.8f), R);
+			// a subtle wash of the rarity colour over the whole well (no corner beads or caps: the user removed them)
+			RoundFill(Rect.ExpandBy(-1.0f * S), WithAlpha(Color * 0.5f, bHovered ? 0.3f : 0.2f), R);
+			Blob(FVector2D(Mid.X, Rect.Max.Y - TileH * 0.26f), FVector2D(TileW * 0.94f, TileH * 0.62f), 0.0f, WithAlpha(Color * 0.75f, bHovered ? 0.6f : 0.45f), true);
+			Blob(Mid, FVector2D(TileH * 0.66f, TileH * 0.66f), 0.0f, WithAlpha(FMath::Lerp(Color, FLinearColor::White, 0.3f), 0.16f), true);
+			Blob(FVector2D(Mid.X, Rect.Min.Y + TileH * 0.12f), FVector2D(TileW * 0.92f, TileH * 0.3f), 0.0f, FLinearColor(0.0f, 0.0f, 0.0f, 0.4f), true);
+			NacreRim(Rect, FMath::Lerp(Color, FLinearColor::White, 0.1f), R, 2.0f * S);
+		}
+		else
+		{
+			RoundFill(Rect, InsetColor, R);
+			RoundFill(Rect.ExpandBy(-1.0f * UIScale), WithAlpha(Color * (bHovered ? 0.5f : 0.3f), 0.85f), R);
+			RoundFrame(Rect, WithAlpha(Color, bHovered ? 1.0f : 0.8f), R, 1.5f * UIScale);
+		}
 	}
 	Icon(TDIcons::ForItem(*Item), Rect.ExpandBy(-5.0f * UIScale));
 	if (Tris.Num() > 0 && Canvas)
 	{
-		FCanvasTriangleItem Gems(TArray<FCanvasUVTri>(Tris), GWhiteTexture);
+		TArray<FCanvasUVTri> GemTris(Tris);
+		FCanvasTriangleItem Gems(GemTris, WhiteTriangles(GemTris));
 		Gems.BlendMode = SE_BLEND_Translucent;
 		Canvas->DrawItem(Gems);
 	}
@@ -1216,7 +2415,7 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 		const float B = FMath::Max(11.0f, 15.0f * S);
 		const FVector2D C(Rect.Min.X + 3.0f * S + B * 0.5f, Rect.Max.Y - 3.0f * S - B * 0.5f);
 		const FLinearColor Dark(0.02f, 0.05f, 0.08f, 0.95f);
-		const float Ring = FMath::Max(1.5f, 2.0f * S);
+		const float Ring = FMath::Max(1.5f, 1.8f * S);	// the same width of dark setting round every shape
 		// a convex polygon (3 or 4 corners) as a triangle fan around its centre; drawn for every stored item each frame, so no heap use
 		using FCorners = TArray<FVector2D, TInlineAllocator<4>>;
 		auto Poly = [this, C](const FCorners& Points, const FLinearColor& Color)
@@ -1229,7 +2428,7 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 				Tri.V0_Pos = C; Tri.V1_Pos = Points[i]; Tri.V2_Pos = Points[(i + 1) % Points.Num()];
 				Tri.V0_Color = Tri.V1_Color = Tri.V2_Color = Color;
 			}
-			FCanvasTriangleItem Fan(Tris, GWhiteTexture);
+			FCanvasTriangleItem Fan(Tris, WhiteTriangles(Tris));
 			Fan.BlendMode = SE_BLEND_Translucent;
 			Canvas->DrawItem(Fan);
 		};
@@ -1239,27 +2438,35 @@ void ATDHUD::ItemTile(const FBox2D& Rect, const FTDItem* Item, EButton Id, int32
 		case ETDItemSlot::Pearl:
 		{
 			// diamond
+			// all three shapes fill the same box (about 0.95 B tall) on the same centre
 			auto Diamond = [C](float H) { return FCorners{ C + FVector2D(0, -H), C + FVector2D(H, 0), C + FVector2D(0, H), C + FVector2D(-H, 0) }; };
-			Poly(Diamond(B * 0.62f + Ring * 1.4f), Dark);
-			Poly(Diamond(B * 0.62f), SlotCol);
+			Poly(Diamond(B * 0.5f + Ring * 1.414f), Dark);
+			Poly(Diamond(B * 0.5f), SlotCol);
 			break;
 		}
 		case ETDItemSlot::Charm:
 		{
 			// upward triangle around the centre
-			auto Triangle = [C](float H) { return FCorners{ C + FVector2D(0, -H), C + FVector2D(H * 0.866f, H * 0.5f), C + FVector2D(-H * 0.866f, H * 0.5f) }; };
-			Poly(Triangle(B * 0.66f + Ring * 2.0f), Dark);
-			Poly(Triangle(B * 0.66f), SlotCol);
+			// centred on its box rather than its centroid, so it sits level with the circle and diamond
+			const FVector2D TC = C + FVector2D(0.0f, B * 0.6f * 0.25f);
+			auto Triangle = [TC](float H) { return FCorners{ TC + FVector2D(0, -H), TC + FVector2D(H * 0.866f, H * 0.5f), TC + FVector2D(-H * 0.866f, H * 0.5f) }; };
+			Poly(Triangle(B * 0.6f + Ring * 2.0f), Dark);
+			Poly(Triangle(B * 0.6f), SlotCol);
 			break;
 		}
 		default:
 		{
 			// circle
-			const FBox2D Dot(C - FVector2D(B * 0.42f), C + FVector2D(B * 0.42f));
-			RoundFill(Dot.ExpandBy(Ring), Dark, B * 0.42f + Ring);
-			RoundFill(Dot, SlotCol, B * 0.42f);
+			const FBox2D Dot(C - FVector2D(B * 0.47f), C + FVector2D(B * 0.47f));
+			RoundFill(Dot.ExpandBy(Ring), Dark, B * 0.47f + Ring);
+			RoundFill(Dot, SlotCol, B * 0.47f);
 			break;
 		}
+		}
+		if (bDetailed)
+		{
+			// an enamel cabochon: a glint on its upper left
+			Blob(C + FVector2D(-B * 0.13f, -B * 0.13f), FVector2D(B * 0.24f, B * 0.17f), -35.0f, FLinearColor(1.0f, 1.0f, 1.0f, 0.5f), true);
 		}
 	}
 
@@ -1299,6 +2506,7 @@ void ATDHUD::DrawHUD()
 	TipLines.Reset();
 	StorageRect = FBox2D(ForceInit);
 	TopLeftRect = FBox2D(ForceInit);
+	PreviewPillBottom = 0.0f;
 	TopRightRect = FBox2D(ForceInit);
 
 	if (!Canvas || !HUDFont())
@@ -1376,6 +2584,7 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 		FBox2D Rect;
 	};
 	TArray<FChipRow, TInlineAllocator<64>> ChipRows;
+	const bool bDetailedUI = DetailedUI();
 
 	for (const ATDEnemy* Enemy : GameMode->GetEnemies())
 	{
@@ -1399,7 +2608,12 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 		const float Y = Screen.Y - H * 0.5f;
 
 		// rounded health pill on damaged enemies: coral when low, kelp green when healthy
-		if (bDamaged)
+		if (bDamaged && bDetailedUI)
+		{
+			const float Fraction = FMath::Clamp(Enemy->GetHealth() / Enemy->GetMaxHealth(), 0.0f, 1.0f);
+			GlassBar(FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H)), Fraction, FMath::Lerp(LifeColor, KelpColor, Fraction), bBoss);
+		}
+		else if (bDamaged)
 		{
 			const float Fraction = FMath::Clamp(Enemy->GetHealth() / Enemy->GetMaxHealth(), 0.0f, 1.0f);
 			const FBox2D Track(FVector2D(X - 1, Y - 1), FVector2D(X + W + 1, Y + H + 1));
@@ -1413,11 +2627,18 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 		if (Enemy->GetShield() > 0.0f)
 		{
 			const float ShieldFraction = FMath::Clamp(Enemy->GetShield() / FMath::Max(1.0f, Enemy->GetMaxShield()), 0.0f, 1.0f);
-			const FBox2D Track(FVector2D(X - 1, Y - H - 2), FVector2D(X + W + 1, Y - 1));
-			RoundFill(Track, FLinearColor(0, 0, 0, 0.7f), Track.GetSize().Y * 0.5f);
-			if (ShieldFraction > 0.0f)
+			if (bDetailedUI)
 			{
-				RoundFill(FBox2D(FVector2D(X, Y - H - 1), FVector2D(X + FMath::Max(H, W * ShieldFraction), Y - 2)), AccentColor, (H - 1) * 0.5f);
+				GlassBar(FBox2D(FVector2D(X, Y - H - 2), FVector2D(X + W, Y - 3)), ShieldFraction, AccentColor, false);
+			}
+			else
+			{
+				const FBox2D Track(FVector2D(X - 1, Y - H - 2), FVector2D(X + W + 1, Y - 1));
+				RoundFill(Track, FLinearColor(0, 0, 0, 0.7f), Track.GetSize().Y * 0.5f);
+				if (ShieldFraction > 0.0f)
+				{
+					RoundFill(FBox2D(FVector2D(X, Y - H - 1), FVector2D(X + FMath::Max(H, W * ShieldFraction), Y - 2)), AccentColor, (H - 1) * 0.5f);
+				}
 			}
 		}
 
@@ -1471,7 +2692,15 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 		{
 			const FBox2D Dot(FVector2D(CX, CY), FVector2D(CX + Chip, CY + Chip));
 			RoundFill(Dot.ExpandBy(1.0f), FLinearColor(0, 0, 0, 0.75f), Chip);
-			RoundFill(Dot, TD::StatusColor(Status), Chip);
+			if (bDetailedUI)
+			{
+				// a lit gem in the effect's colour
+				Pearl(Dot.GetCenter(), Chip * 0.5f, TD::StatusColor(Status));
+			}
+			else
+			{
+				RoundFill(Dot, TD::StatusColor(Status), Chip);
+			}
 			CX += Chip + Gap;
 		}
 	}
@@ -1495,8 +2724,27 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 				const float H = Extent.Y + 4.0f * S;
 				const FBox2D Badge(FVector2D(Screen.X - W * 0.5f, Screen.Y - H * 0.5f), FVector2D(Screen.X + W * 0.5f, Screen.Y + H * 0.5f));
 				// pill badge, gold rimmed when the tower has skill points to spend
+				const bool bPoints = Tower->GetSkillPoints() > 0;
 				RoundFill(Badge, TipColor, H * 0.5f);
-				RoundFrame(Badge, Tower->GetSkillPoints() > 0 ? PearlColor : WithAlpha(AccentColor, 0.6f), H * 0.5f, 1.0f * S);
+				if (bDetailedUI)
+				{
+					// dark glass with light along its top and a brighter rim; a twinkle on the corner when there are points to spend
+					RoundFill(FBox2D(Badge.Min + FVector2D(H * 0.3f, 1.5f * S), FVector2D(Badge.Max.X - H * 0.3f, Badge.Min.Y + H * 0.42f)), FLinearColor(1.0f, 1.0f, 1.0f, 0.1f), H * 0.2f);
+					RoundFrame(Badge.ExpandBy(1.0f), FLinearColor(0.0f, 0.0f, 0.0f, 0.5f), H * 0.5f + 1.0f, 1.0f);
+					RoundFrame(Badge, bPoints ? PearlColor : WithAlpha(AccentColor, 0.85f), H * 0.5f, 1.5f * S);
+					if (bPoints)
+					{
+						const FVector2D Star(Badge.Max.X - H * 0.3f, Badge.Min.Y + 1.0f * S);
+						const float Pulse = 0.75f + 0.25f * (float)FMath::Sin(Now() * 3.0 + Tower->GetActorLocation().X * 0.01);
+						Blob(Star, FVector2D(2.0f, 11.0f) * S * Pulse, 0.0f, FLinearColor(1.0f, 0.97f, 0.85f, 0.95f));
+						Blob(Star, FVector2D(11.0f, 2.0f) * S * Pulse, 0.0f, FLinearColor(1.0f, 0.97f, 0.85f, 0.95f));
+						Blob(Star, FVector2D(5.0f, 5.0f) * S, 0.0f, WithAlpha(PearlColor, 0.6f), true);
+					}
+				}
+				else
+				{
+					RoundFrame(Badge, bPoints ? PearlColor : WithAlpha(AccentColor, 0.6f), H * 0.5f, 1.0f * S);
+				}
 				Text(Label, Screen.X, Screen.Y, Tower->GetSkillPoints() > 0 ? PearlColor : AccentColor, 16.0f, true, true);
 			}
 		}
@@ -1504,18 +2752,29 @@ void ATDHUD::DrawWorldOverlays(ATDGameMode* GameMode)
 
 	// floating texts ("+N", "LEVEL N")
 	const double Time = Now();
-	for (int32 i = Floaters.Num() - 1; i >= 0; --i)
+	Floaters.RemoveAll([Time](const FFloater& F) { return (float)(Time - F.Start) > FloaterDuration; });
+	// all the halos first, then all the texts: alternating glow and text would start two draws per floater
+	for (int32 Pass = bDetailedUI ? 0 : 1; Pass < 2; ++Pass)
 	{
-		const FFloater& F = Floaters[i];
-		const float Age = (float)(Time - F.Start);
-		if (Age > FloaterDuration)
+		for (int32 i = Floaters.Num() - 1; i >= 0; --i)
 		{
-			Floaters.RemoveAt(i);
-			continue;
+			const FFloater& F = Floaters[i];
+			const float Age = (float)(Time - F.Start);
+			const float Alpha = 1.0f - Age / FloaterDuration;
+			const FVector Screen = Project(F.World + FVector(0, 0, Age * 60.0f));
+			const float FloatSize = F.Text.StartsWith(TEXT("LEVEL")) ? 26.0f : 22.0f;
+			if (Pass == 0)
+			{
+				// a soft halo of the text's own colour behind it, so it glows off the board
+				const FVector2D Extent = MeasureText(F.Text, FloatSize);
+				const FBox2D Halo(FVector2D(Screen.X, Screen.Y) - Extent * 0.5f, FVector2D(Screen.X, Screen.Y) + Extent * 0.5f);
+				Glow(Halo.ExpandBy(FVector2D(-Extent.X * 0.1f, -Extent.Y * 0.2f)), WithAlpha(F.Color, 0.3f * Alpha), Extent.Y * 0.3f, 10.0f * UIScale);
+			}
+			else
+			{
+				Text(F.Text, Screen.X, Screen.Y, WithAlpha(F.Color, Alpha), FloatSize, true, true);
+			}
 		}
-		const float Alpha = 1.0f - Age / FloaterDuration;
-		const FVector Screen = Project(F.World + FVector(0, 0, Age * 60.0f));
-		Text(F.Text, Screen.X, Screen.Y, WithAlpha(F.Color, Alpha), F.Text.StartsWith(TEXT("LEVEL")) ? 26.0f : 22.0f, true, true);
 	}
 }
 
@@ -2114,7 +3373,14 @@ void ATDHUD::DrawTooltip()
 	Glow(FBox2D(Card.Min + FVector2D(0, 6.0f * S), Card.Max + FVector2D(0, 6.0f * S)), ShadowColor, R, 14.0f * S);
 	RoundFill(Card, TipColor, R);
 	RoundFill(FBox2D(Card.Min, FVector2D(Card.Max.X, Y + Pad + Line + TitleGap * 0.5f)), WithAlpha(Border, 0.12f), R);
-	RoundFrame(Card, WithAlpha(Border, 0.85f), R, 1.5f * S);
+	if (DetailedUI())
+	{
+		DetailedCardEdge(Card, Border, R, 1.0f);
+	}
+	else
+	{
+		RoundFrame(Card, WithAlpha(Border, 0.85f), R, 1.5f * S);
+	}
 	// a thin wave under the title band instead of a straight edge
 	if (Lines.Num() > 1)
 	{
@@ -2220,7 +3486,14 @@ void ATDHUD::DrawWaveClearCard(ATDGameMode* GameMode)
 
 	const FBox2D Card(FVector2D(X, Y), FVector2D(X + CardW, Y + CardH));
 	RoundFill(Card, WithAlpha(PanelColor, PanelColor.A * Alpha), RadiusButton * S);
-	RoundFrame(Card, WithAlpha(KelpColor, 0.55f * Alpha), RadiusButton * S, 1.0f * S);
+	if (DetailedUI())
+	{
+		DetailedCardEdge(Card, KelpColor, RadiusButton * S, Alpha);
+	}
+	else
+	{
+		RoundFrame(Card, WithAlpha(KelpColor, 0.55f * Alpha), RadiusButton * S, 1.0f * S);
+	}
 	float LY = Y + Pad + 10.0f * S;
 	Text(Title, X + Pad, LY, WithAlpha(KelpColor, Alpha), SizeField, false, true);
 	LY += 22.0f * S;
@@ -2251,6 +3524,7 @@ void ATDHUD::DrawToasts()
 	{
 		Y = FMath::Max(Y, TopLeftRect.Max.Y + 12.0f * S);
 	}
+	Y = FMath::Max(Y, PreviewPillBottom + 8.0f * S);
 
 	for (const FToast& Toast : Toasts)
 	{
@@ -2266,11 +3540,26 @@ void ATDHUD::DrawToasts()
 		// pill with a rim and a dot in the message color
 		const FBox2D Pill(FVector2D(X, Y + Slide), FVector2D(X + W, Y + Slide + H));
 		RoundFill(Pill, WithAlpha(TipColor, 0.88f * Alpha), H * 0.5f);
-		RoundFrame(Pill, WithAlpha(Toast.Color, 0.45f * Alpha), H * 0.5f, 1.0f * S);
+		const bool bDetailedToast = DetailedUI();
+		if (bDetailedToast)
+		{
+			DetailedCardEdge(Pill, Toast.Color, H * 0.5f, Alpha);
+		}
+		else
+		{
+			RoundFrame(Pill, WithAlpha(Toast.Color, 0.45f * Alpha), H * 0.5f, 1.0f * S);
+		}
 		const float Dot = 7.0f * S;
 		const FBox2D DotRect(FVector2D(X + 14.0f * S, Pill.GetCenter().Y - Dot * 0.5f), FVector2D(X + 14.0f * S + Dot, Pill.GetCenter().Y + Dot * 0.5f));
 		Glow(DotRect, WithAlpha(Toast.Color, 0.4f * Alpha), Dot * 0.5f, 4.0f * S);
-		RoundFill(DotRect, WithAlpha(Toast.Color, Alpha), Dot * 0.5f);
+		if (bDetailedToast)
+		{
+			Pearl(DotRect.GetCenter(), Dot * 0.6f, WithAlpha(Toast.Color, Alpha));
+		}
+		else
+		{
+			RoundFill(DotRect, WithAlpha(Toast.Color, Alpha), Dot * 0.5f);
+		}
 		Text(Toast.Text, Canvas->ClipX * 0.5f + 8.0f * S, Pill.GetCenter().Y, WithAlpha(Toast.Color, Alpha), 18.0f, true, true);
 		// two tiny bubbles drifting up past the pill's right end
 		for (int32 b = 0; b < 2; ++b)
@@ -2328,7 +3617,14 @@ void ATDHUD::DrawCursorHint(ATDGameMode* GameMode, ATDPlayerController* PC)
 		const float HY = MousePos.Y + 16.0f * UIScale;
 		const FBox2D Pill(FVector2D(HX - 10.0f * UIScale, HY - 4.0f * UIScale), FVector2D(HX + Extent.X + 10.0f * UIScale, HY + Extent.Y + 4.0f * UIScale));
 		RoundFill(Pill, TipColor, Pill.GetSize().Y * 0.5f);
-		RoundFrame(Pill, WithAlpha(Color, 0.5f), Pill.GetSize().Y * 0.5f, 1.0f * UIScale);
+		if (DetailedUI())
+		{
+			DetailedCardEdge(Pill, Color, Pill.GetSize().Y * 0.5f, 1.0f);
+		}
+		else
+		{
+			RoundFrame(Pill, WithAlpha(Color, 0.5f), Pill.GetSize().Y * 0.5f, 1.0f * UIScale);
+		}
 		Text(Hint, HX, HY, Color, 18.0f);
 	}
 }

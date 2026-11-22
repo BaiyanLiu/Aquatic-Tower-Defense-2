@@ -12,6 +12,7 @@ class UStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UPointLightComponent;
 class UInstancedStaticMeshComponent;
+struct FTDPrewarmExtras;
 
 /** One range indicator to draw: a ring at the range, a soft disc inside, optionally tinted tiles */
 struct FTDRangeView
@@ -47,6 +48,9 @@ public:
 
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaTime) override;
+
+	/** Adds the current map's painted board and the seabed props to the startup prewarm, so the first board builds quickly */
+	static void AddPrewarmWork(FTDPrewarmExtras& Extras);
 
 	// ---- Cells ----
 
@@ -232,6 +236,11 @@ protected:
 	TObjectPtr<UInstancedStaticMeshComponent> FishISM;
 	UPROPERTY()
 	TObjectPtr<UInstancedStaticMeshComponent> BubbleISM;
+	/** The detailed look: a bright catch light riding on each vent bubble */
+	UPROPERTY()
+	TObjectPtr<UInstancedStaticMeshComponent> BubbleGlintISM;
+	/** Whether the range rings were made with the detailed (rounded) segments */
+	bool bRoundRings = false;
 	UPROPERTY()
 	TObjectPtr<USceneComponent> Manta;
 

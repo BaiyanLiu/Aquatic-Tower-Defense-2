@@ -22,6 +22,8 @@ enum class ETDSound : uint8
 	Click,
 	Upgrade,
 	TierUnlock,		// an Abyss tier unlocked (appended: the sounds above keep their numbers)
+	BossSting,		// a boss wave is released: deep horn and drum hit
+	Split,			// a sea star splits off a copy
 	Count
 };
 
@@ -35,6 +37,14 @@ namespace TDAudio
 
 	/** The firing sound of a tower type (walls and aura towers are silent) */
 	void PlayShot(const UObject* WorldContext, ETDTowerType Tower);
+
+	/** A creature's own death sound (S_Death_<kind>), or the generic kill sound if it has none */
+	void PlayDeath(const UObject* WorldContext, ETDEnemyType Enemy, float Volume = 1.0f);
+
+	/** Music sets: each pairs an ambient loop with a boss loop on the same chords and 48 s length. The set follows the
+	 *  map in play (checked in TickMusic), so each map has its own music; the switch fades across a second. */
+	constexpr int32 MusicSetCount = 3;
+	int32 MusicSetForMap(int32 Map);
 
 	/** Effects and music volume, 0-1 (0 silences) */
 	void SetVolumes(float Effects, float Music);
@@ -50,8 +60,11 @@ namespace TDAudio
 	/** Pitch of both loops (Abyss tiers play the music a little lower) */
 	void SetMusicPitch(float Pitch);
 
-	/** Advances the crossfade; pass real seconds so game speed doesn't change the fade */
+	/** Advances the crossfade and the music set change; pass real seconds so game speed doesn't change the fades */
 	void TickMusic(float RealDeltaSeconds);
 
 	constexpr float BossFadeSeconds = 2.0f;
+
+	/** Asset names of every sound the game plays (effects, tower shots, creature deaths, every music set's loops), for the asset test */
+	TArray<FString> AllSoundNames();
 }

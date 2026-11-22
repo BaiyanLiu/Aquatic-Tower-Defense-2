@@ -227,8 +227,17 @@ protected:
 
 	float AnimTime = 0.0f;
 
-	/** Crab scuttle, which follows the current speed */
-	float WalkPhase = 0.0f;
+	/** Locomotion clock: runs at the creature's real pace, so slowed creatures move their limbs slower and stunned ones almost stop */
+	float GaitTime = 0.0f;
+	float GaitRate = 1.0f;
+	/** 0..1, eases in while stunned: the creature wobbles dizzily */
+	float StunWobble = 0.0f;
+	/** Degrees of lean into the current turn */
+	float Bank = 0.0f;
+	/** Seconds since it appeared, for the spawn pop */
+	float Age = 0.0f;
+	/** Scale of the whole model this frame (spawn pop, death squash and shrink) */
+	FVector VisualScale = FVector::OneVector;
 
 	/** The model's pivots as plain transforms, in model order: pivot 0 is the actor, and each pivot's parent comes before it */
 	TArray<int32> PivotParents;
@@ -271,6 +280,8 @@ protected:
 	float DyingTime = 0.0f;
 	FVector DeathLocation = FVector::ZeroVector;
 	FRotator DeathRotation = FRotator::ZeroRotator;
+	/** The body pivot as it was at the moment of death, which the death roll turns about its middle */
+	FTransform DeathBody = FTransform::Identity;
 	float FlinchTime = 0.0f;
 	void TickDying(float DeltaTime);
 

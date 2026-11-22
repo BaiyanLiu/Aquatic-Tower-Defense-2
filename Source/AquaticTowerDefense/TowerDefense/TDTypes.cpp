@@ -14,18 +14,18 @@ namespace
 {
 	const FTDTowerDef GTowers[] =
 	{
-		// Name					Description											Key			Cost	Range	Damage	Rate	Damage type				Proj	Attacks	Flying	Support
-		{ TEXT("Coral Wall"),		TEXT("Cheap blocker. Shapes the maze, never attacks."),	TEXT("1"),	4,		0.0f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	false },
-		{ TEXT("Harpoon"),			TEXT("Long-range homing harpoon. Hits swimming."),		TEXT("2"),	22,		5.0f,	22.0f,	0.55f,	ETDDamageType::Normal,	12.0f,	true,	true,	false },
-		{ TEXT("Jellyfish"),			TEXT("Pulse hits everything in range and slows it."),	TEXT("3"),	28,		2.3f,	3.0f,	1.1f,	ETDDamageType::Light,	0.0f,	true,	true,	false },
-		{ TEXT("Puffer Mortar"),		TEXT("Lobbed bomb with splash. Crawling only."),			TEXT("4"),	40,		3.8f,	22.0f,	0.55f,	ETDDamageType::Heavy,	4.5f,	true,	false,	false },
-		{ TEXT("Electric Eel"),		TEXT("Chain lightning that ignores armor."),			TEXT("5"),	65,		3.0f,	16.0f,	0.8f,	ETDDamageType::Light,	0.0f,	true,	true,	false },
-		{ TEXT("Mantis Shrimp"),		TEXT("Instant heavy punch that stuns. Short range, crawling only."),	TEXT("6"),	30,		1.6f,	34.0f,	0.5f,	ETDDamageType::Heavy,	0.0f,	true,	false,	false },
-		{ TEXT("Octopus"),		TEXT("Two arms take turns throwing light stones, very fast. Hits swimming."),			TEXT("7"),	15,		2.2f,	3.0f,	4.0f,	ETDDamageType::Light,	10.0f,	true,	true,	false },
-		{ TEXT("Lionfish"),		TEXT("Venom spines poison targets: damage every half second."),	TEXT("8"),	20,		2.6f,	3.0f,	1.0f,	ETDDamageType::Normal,	7.0f,	true,	true,	false },
-		{ TEXT("Sawfish"),		TEXT("Thrown teeth bleed targets for a share of their health."),	TEXT("9"),	30,		2.2f,	6.0f,	1.0f,	ETDDamageType::Light,	8.0f,	true,	true,	false },
-		{ TEXT("Humpback"),			TEXT("Aura: whale song makes nearby towers attack faster."),				TEXT("0"),	30,		2.5f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	true },
-		{ TEXT("Acid Vent"),		TEXT("Aura: acid plume lowers armor of nearby enemies."),			TEXT("-"),	40,		2.0f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	true },
+		// Name					Description											Cost	Range	Damage	Rate	Damage type				Proj	Attacks	Flying	Support
+		{ TEXT("Coral Wall"),		TEXT("Cheap blocker. Shapes the maze, never attacks."),	4,		0.0f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	false },
+		{ TEXT("Harpoon"),			TEXT("Long-range homing harpoon. Hits swimming."),		22,		5.0f,	22.0f,	0.55f,	ETDDamageType::Normal,	12.0f,	true,	true,	false },
+		{ TEXT("Jellyfish"),			TEXT("Pulse hits everything in range and slows it."),	28,		2.3f,	3.0f,	1.1f,	ETDDamageType::Light,	0.0f,	true,	true,	false },
+		{ TEXT("Puffer Mortar"),		TEXT("Lobbed bomb with splash. Crawling only."),			40,		3.8f,	22.0f,	0.55f,	ETDDamageType::Heavy,	4.5f,	true,	false,	false },
+		{ TEXT("Electric Eel"),		TEXT("Chain lightning that ignores armor."),			65,		3.0f,	16.0f,	0.8f,	ETDDamageType::Light,	0.0f,	true,	true,	false },
+		{ TEXT("Mantis Shrimp"),		TEXT("Instant heavy punch that stuns. Short range, crawling only."),	30,		1.6f,	34.0f,	0.5f,	ETDDamageType::Heavy,	0.0f,	true,	false,	false },
+		{ TEXT("Octopus"),		TEXT("Two arms take turns throwing light stones, very fast. Hits swimming."),			15,		2.2f,	3.0f,	4.0f,	ETDDamageType::Light,	10.0f,	true,	true,	false },
+		{ TEXT("Lionfish"),		TEXT("Venom spines poison targets: damage every half second."),	20,		2.6f,	3.0f,	1.0f,	ETDDamageType::Normal,	7.0f,	true,	true,	false },
+		{ TEXT("Sawfish"),		TEXT("Thrown teeth bleed targets for a share of their health."),	30,		2.2f,	6.0f,	1.0f,	ETDDamageType::Light,	8.0f,	true,	true,	false },
+		{ TEXT("Humpback"),			TEXT("Aura: whale song makes nearby towers attack faster."),				30,		2.5f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	true },
+		{ TEXT("Acid Vent"),		TEXT("Aura: acid plume lowers armor of nearby enemies."),			40,		2.0f,	0.0f,	0.0f,	ETDDamageType::None,	0.0f,	false,	false,	true },
 	};
 	static_assert(UE_ARRAY_COUNT(GTowers) == (int32)ETDTowerType::Count, "Tower table out of sync");
 
@@ -348,21 +348,72 @@ TD::FTDDeathPose TD::DeathPose(float Alpha, bool bSwimming)
 {
 	const float A = FMath::Clamp(Alpha, 0.0f, 1.0f);
 	FTDDeathPose Pose;
+	// the killing blow squashes the body for the first eighth
+	constexpr float Impact = 0.12f;
+	if (A < Impact)
+	{
+		Pose.Squash = 1.0f - 0.22f * FMath::Sin(PI * A / Impact);
+	}
+	// shrinks a little while it sinks, so it slips away instead of clipping through the floor
+	Pose.Scale = 1.0f - 0.35f * FMath::SmoothStep(0.6f, 1.0f, A);
 	if (bSwimming)
 	{
-		// spiral down to the floor, then a little way into it
+		// rolls belly-up while spiralling down to the floor, then a little way into it; fins go slack
 		Pose.Drop = FMath::InterpEaseIn(0.0f, 1.0f, FMath::Min(1.0f, A / 0.8f), 1.6f);
-		Pose.Spin = 540.0f * A;
-		Pose.Roll = 35.0f * FMath::Min(1.0f, A / 0.3f);
+		Pose.Spin = 400.0f * FMath::InterpEaseOut(0.0f, 1.0f, A, 1.5f);
+		Pose.Roll = 160.0f * FMath::InterpEaseInOut(0.0f, 1.0f, FMath::Min(1.0f, A / 0.7f), 2.0f);
 		Pose.Sink = 30.0f * FMath::SmoothStep(0.75f, 1.0f, A);
+		Pose.Limp = FMath::Min(1.0f, A / 0.5f);
 	}
 	else
 	{
-		// roll over onto the back in the first 40%, then sink into the sand
-		Pose.Roll = 160.0f * FMath::InterpEaseOut(0.0f, 1.0f, FMath::Min(1.0f, A / 0.4f), 2.0f);
-		Pose.Sink = 48.0f * FMath::SmoothStep(0.25f, 1.0f, A);
+		// thrown up and flipped onto its back in the first 35%, lands with a squash and a rocking settle, then sinks into the sand
+		constexpr float Flip = 0.35f;
+		const float F = FMath::Min(1.0f, A / Flip);
+		Pose.Hop = 14.0f * FMath::Sin(PI * F);
+		Pose.Roll = 170.0f * FMath::InterpEaseOut(0.0f, 1.0f, F, 2.0f);
+		if (A > Flip)
+		{
+			const float T = A - Flip;
+			Pose.Roll += 14.0f * FMath::Sin(T * 28.0f) * FMath::Exp(-T * 9.0f);
+			if (T < 0.12f)
+			{
+				Pose.Squash = 1.0f - 0.15f * FMath::Sin(PI * T / 0.12f);
+			}
+		}
+		Pose.Sink = 48.0f * FMath::SmoothStep(0.45f, 1.0f, A);
+		Pose.Limp = FMath::InterpEaseOut(0.0f, 1.0f, FMath::Min(1.0f, A / 0.4f), 2.0f);
 	}
 	return Pose;
+}
+
+float TD::RecoilCurve(float U)
+{
+	if (U <= 0.0f || U >= 1.0f)
+	{
+		return 0.0f;
+	}
+	constexpr float Snap = 0.08f;
+	if (U < Snap)
+	{
+		return FMath::SmoothStep(0.0f, Snap, U);
+	}
+	// a damped spring back to rest, dipping just past it once
+	const float T = (U - Snap) / (1.0f - Snap);
+	return FMath::Exp(-4.5f * T) * FMath::Cos(T * 2.4f * PI) * (1.0f - T);
+}
+
+float TD::SpawnPopScale(float Age)
+{
+	if (Age >= SpawnPopSeconds)
+	{
+		return 1.0f;
+	}
+	// ease-out-back from 30% size
+	const float T = FMath::Max(0.0f, Age) / SpawnPopSeconds - 1.0f;
+	constexpr float C1 = 1.70158f;
+	const float Back = 1.0f + (C1 + 1.0f) * T * T * T + C1 * T * T;
+	return 0.3f + 0.7f * Back;
 }
 
 float TD::ModifierChance(int32 Wave)

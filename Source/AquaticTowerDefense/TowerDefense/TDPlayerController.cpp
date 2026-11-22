@@ -21,6 +21,7 @@
 #include "SceneView.h"
 #include "TimerManager.h"
 #include "Misc/App.h"
+#include "Containers/Ticker.h"
 
 ATDPlayerController::ATDPlayerController()
 {
@@ -1205,6 +1206,89 @@ void ATDPlayerController::ATDPreview(int32 TowerType, int32 X, int32 Y)
 	{
 		SimSetCursor(Screen);
 	}
+#endif
+}
+
+void ATDPlayerController::ATDPlaceBench(float Delay)
+{
+#if !UE_BUILD_SHIPPING
+	if (Delay > 0.0f)
+	{
+		// the core ticker, which keeps going behind the menus (world timers pause with the game)
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateWeakLambda(this, [this](float)
+		{
+			ATDPlaceBench(0.0f);
+			return false;
+		}), Delay);
+		return;
+	}
+	ATDGameMode* GameMode = GetTDGameMode();
+	ATDGrid* Grid = GameMode ? GameMode->GetGrid() : nullptr;
+	if (!Grid)
+	{
+		return;
+	}
+	GameMode->DebugAddPearls(1000000);
+	// a row of walls, every other tile of the next row (links on the diagonals too), then one of each tower further down
+	TArray<TPair<FIntPoint, ETDTowerType>> Order;
+	for (int32 X = 2; X < TD::Cols - 2; ++X)
+	{
+		Order.Add({ FIntPoint(X, 2), ETDTowerType::Wall });
+	}
+	for (int32 X = 3; X < TD::Cols - 2; X += 2)
+	{
+		Order.Add({ FIntPoint(X, 3), ETDTowerType::Wall });
+	}
+	for (int32 t = 0; t < TD::TowerTypeCount; ++t)
+	{
+		if ((ETDTowerType)t != ETDTowerType::Wall)
+		{
+			Order.Add({ FIntPoint(2 + t * 2, 6), (ETDTowerType)t });
+		}
+	}
+	int32 Placed = 0;
+	double Total = 0.0, Worst = 0.0;
+	for (const TPair<FIntPoint, ETDTowerType>& Step : Order)
+	{
+		const FIntPoint Cell = Step.Key;
+		if (Grid->EvaluatePlacement(Cell) != ETDPlaceResult::Ok)
+		{
+			continue;
+		}
+		const double Start = FPlatformTime::Seconds();
+		ATDTower* Tower = GameMode->TryPlaceTower(Cell, Step.Value, true);
+		const double Ms = (FPlatformTime::Seconds() - Start) * 1000.0;
+		if (Tower)
+		{
+			UE_LOG(LogAquaticTowerDefense, Display, TEXT("PLACEBENCH %s at (%d,%d): %.2f ms"), TD::Tower(Step.Value).Name, Cell.X, Cell.Y, Ms);
+			Total += Ms;
+			Worst = FMath::Max(Worst, Ms);
+			++Placed;
+		}
+	}
+	UE_LOG(LogAquaticTowerDefense, Display, TEXT("PLACEBENCH placed %d: %.1f ms total, worst %.1f ms; watching frames for 10 s"), Placed, Total, Worst);
+
+	// the background work the placements started (sculpted walls) lands over the next frames: log any long frame
+	struct FWatch { double End; double Last; double WorstFrame = 0.0; int32 Long = 0; };
+	TSharedRef<FWatch> Watch = MakeShared<FWatch>(FWatch{ FPlatformTime::Seconds() + 10.0, FPlatformTime::Seconds() });
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Watch](float)
+	{
+		const double Now = FPlatformTime::Seconds();
+		const double FrameMs = (Now - Watch->Last) * 1000.0;
+		Watch->Last = Now;
+		Watch->WorstFrame = FMath::Max(Watch->WorstFrame, FrameMs);
+		if (FrameMs > 34.0)
+		{
+			++Watch->Long;
+			UE_LOG(LogAquaticTowerDefense, Display, TEXT("PLACEBENCH long frame %.1f ms"), FrameMs);
+		}
+		if (Now < Watch->End)
+		{
+			return true;
+		}
+		UE_LOG(LogAquaticTowerDefense, Display, TEXT("PLACEBENCH DONE: worst frame afterwards %.1f ms, %d over 34 ms"), Watch->WorstFrame, Watch->Long);
+		return false;
+	}));
 #endif
 }
 

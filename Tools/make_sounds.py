@@ -149,14 +149,21 @@ def make_all(out):
     write(os.path.join(out, 'S_Music.wav'), music, fade=False)
 
 
-def make_boss_music(out):
+REEF_CHORDS = [[110.0, 164.81, 220.0, 261.63], [98.0, 146.83, 196.0, 246.94], [87.31, 130.81, 174.61, 220.0], [98.0, 146.83, 196.0, 233.08]]
+# Kelp Crossing: D minor drift (Dm9, Bbmaj7, C6, Am7)
+KELP_CHORDS = [[73.42, 110.0, 174.61, 220.0, 329.63], [58.27, 116.54, 174.61, 220.0, 293.66], [65.41, 130.81, 196.0, 220.0, 329.63], [55.0, 110.0, 164.81, 196.0, 261.63]]
+# Sunken Ruins: E minor, modal and still (Em(add9), Cmaj7, Am7, Bsus4)
+RUINS_CHORDS = [[82.41, 123.47, 164.81, 185.0, 246.94], [65.41, 130.81, 164.81, 196.0, 246.94], [55.0, 110.0, 164.81, 196.0, 261.63], [61.74, 123.47, 164.81, 185.0, 246.94]]
+
+
+def make_boss_music(out, chords=None, name='S_MusicBoss.wav', seed=23):
     """Boss layer: the ambient track's chords and 48 s loop length (so the two crossfade in step), made heavier with
     a low saw drone an octave under each chord root, a slow war-drum pulse, a tremolo tritone for tension and a
     darker filter. Seeded, so running it again gives the same file."""
     length = 48.0
     n = int(length * RATE)
-    rnd = random.Random(23)
-    chords = [[110.0, 164.81, 220.0, 261.63], [98.0, 146.83, 196.0, 246.94], [87.31, 130.81, 174.61, 220.0], [98.0, 146.83, 196.0, 233.08]]
+    rnd = random.Random(seed)
+    chords = chords or REEF_CHORDS
     per = length / len(chords)
     music = [0.0] * n
 
@@ -173,7 +180,7 @@ def make_boss_music(out):
             a = min(1.0, t / 1.5) * min(1.0, max(0.0, (per + 2.0 - t) / 2.0))
             s = 0.0
             # the same pad chord, a little quieter than in the ambient loop
-            for k, f in enumerate(chord):
+            for k, f in enumerate(chord[:4]):
                 s += 0.035 * math.sin(2 * math.pi * f * t + ph[k])
             # drone: two detuned saws an octave below the root, plus a sub sine
             s += 0.06 * (saw(2 * math.pi * (root * 0.5 - 0.4) * t + ph[4]) + saw(2 * math.pi * (root * 0.5 + 0.4) * t + ph[5]))
@@ -195,7 +202,7 @@ def make_boss_music(out):
         base = int((k * beat + beat * 0.5) * RATE)
         for j, s in enumerate(tap):
             music[(base + j) % n] += s
-    write(os.path.join(out, 'S_MusicBoss.wav'), music, fade=False)
+    write(os.path.join(out, name), music, fade=False)
 
 
 def make_tier_unlock(out):
@@ -212,9 +219,156 @@ def make_tier_unlock(out):
     write(os.path.join(out, 'S_TierUnlock.wav'), mix(*parts))
 
 
+def add_into(music, samples, at):
+    """Adds samples into a loop at a time in seconds, wrapping round the end so the loop stays seamless"""
+    n = len(music)
+    base = int(at * RATE)
+    for j, v in enumerate(samples):
+        music[(base + j) % n] += v
+
+
+def pad(chords, length, level, seed, swell=3.0, cutoff=1400):
+    """Slow detuned pad chords, each overlapping the next, as a seamless loop"""
+    rnd = random.Random(seed)
+    n = int(length * RATE)
+    per = length / len(chords)
+    music = [0.0] * n
+    for ci, chord in enumerate(chords):
+        start = ci * per
+        for f in chord:
+            for det in (-0.5, 0.5):
+                ph = rnd.uniform(0, 6.28)
+                w = 2 * math.pi * (f + det)
+                for i in range(int(start * RATE), int(min(length + start, start + per + swell) * RATE)):
+                    t = i / RATE - start
+                    a = min(1.0, t / swell) * min(1.0, max(0.0, (per + swell - t) / swell))
+                    music[i % n] += level * a * math.sin(w * t + ph) * (1.0 + 0.12 * math.sin(2 * math.pi * 0.15 * t))
+    return lowpass(music, cutoff)
+
+
+def mallet(f, length=0.5, decay=0.22):
+    """Soft marimba-like note: fundamental plus a quickly fading fourth harmonic"""
+    return tone(length, lambda t: (math.sin(2 * math.pi * f * t) + 0.35 * math.sin(2 * math.pi * f * 4.0 * t) * math.exp(-t / 0.03)) * env(t, 0.003, decay))
+
+
+def bell(f, length=2.4, decay=0.9):
+    """Struck bell: inharmonic partials that fade at different rates"""
+    return tone(length, lambda t: (math.sin(2 * math.pi * f * t) * env(t, 0.004, decay)
+                                   + 0.45 * math.sin(2 * math.pi * f * 2.76 * t) * env(t, 0.004, decay * 0.45)
+                                   + 0.2 * math.sin(2 * math.pi * f * 5.4 * t) * env(t, 0.004, decay * 0.2)))
+
+
+def make_kelp_music(out):
+    """Kelp Crossing: D minor pads with a drifting marimba arpeggio in eighths (80 bpm, the boss drums' tempo) and a
+    soft bass on each bar. Seeded, 48 s loop; S_MusicBoss2 shares its chords."""
+    length = 48.0
+    rnd = random.Random(41)
+    chords = KELP_CHORDS
+    per = length / len(chords)
+    music = pad(chords, length, 0.035, seed=42, cutoff=1200)
+    eighth = 0.375
+    for ci, chord in enumerate(chords):
+        tones = sorted(set([f * 2 for f in chord[1:]] + [f * 4 for f in chord[2:4]]))
+        steps = int(per / eighth)
+        idx = rnd.randrange(len(tones))
+        for k in range(steps):
+            # a gentle wandering line: mostly steps through the chord, some rests
+            if rnd.random() < 0.22:
+                continue
+            idx = max(0, min(len(tones) - 1, idx + rnd.choice([-1, 1, 1, -1, 2, -2])))
+            accent = 1.0 if k % 4 == 0 else 0.7
+            add_into(music, gain(mallet(tones[idx]), 0.09 * accent * rnd.uniform(0.85, 1.0)), ci * per + k * eighth)
+        for bar in range(int(per / 3.0)):
+            root = chord[0]
+            add_into(music, gain(tone(2.6, lambda t, f=root: math.sin(2 * math.pi * f * t) * env(t, 0.02, 0.9)), 0.16), ci * per + bar * 3.0)
+    for k in range(40):
+        add_into(music, gain(bubble(rnd.uniform(500, 1000), rnd.uniform(0.05, 0.1)), rnd.uniform(0.015, 0.035)), rnd.uniform(0, length))
+    write(os.path.join(out, 'S_Music2.wav'), music, fade=False)
+    make_boss_music(out, KELP_CHORDS, 'S_MusicBoss2.wav', seed=43)
+
+
+def make_ruins_music(out):
+    """Sunken Ruins: still E minor pads over a low drone, sparse bells from the E minor pentatonic and distant
+    low knocks. Seeded, 48 s loop; S_MusicBoss3 shares its chords."""
+    length = 48.0
+    rnd = random.Random(61)
+    chords = RUINS_CHORDS
+    music = pad(chords, length, 0.032, seed=62, swell=4.0, cutoff=900)
+    n = len(music)
+    for i in range(n):
+        t = i / RATE
+        # drone on low E, breathing over 12 s (4 cycles per loop, so it joins up)
+        music[i] += 0.05 * math.sin(2 * math.pi * 41.2 * t) * (0.7 + 0.3 * math.sin(2 * math.pi * t / 12.0))
+    scale = [329.63, 392.0, 440.0, 493.88, 587.33, 659.25, 783.99]
+    t = 0.75
+    while t < length - 0.5:
+        f = rnd.choice(scale)
+        add_into(music, gain(bell(f), 0.07 * rnd.uniform(0.7, 1.0)), t)
+        if rnd.random() < 0.3:
+            # an answering note a fifth or octave below, a beat later
+            add_into(music, gain(bell(f * rnd.choice([0.5, 0.667])), 0.05), t + 0.75)
+        t += rnd.choice([1.5, 2.25, 3.0, 3.0, 4.5])
+    for k in range(12):
+        knock = mix(gain(sweep(140, 60, 0.3, 0.07), 0.5), gain(noise(0.15, 0.03, 700, seed=70 + k), 0.4))
+        add_into(music, gain(lowpass(knock, 600), 0.12), rnd.uniform(0, length))
+    write(os.path.join(out, 'S_Music3.wav'), music, fade=False)
+    make_boss_music(out, RUINS_CHORDS, 'S_MusicBoss3.wav', seed=63)
+
+
+def saw_wave(p):
+    return 2.0 * ((p / (2 * math.pi)) % 1.0) - 1.0
+
+
+def make_creature_sounds(out):
+    """Per-creature death sounds (S_Death_<kind>), the sea star split and the boss wave sting. Seeded: running it
+    again gives the same files."""
+    rnd = random.Random(81)
+    S = {}
+    # crab: a shell crack (three quick clicks) over a small thud
+    clicks = [delay(gain(noise(0.03, 0.006, 6000, seed=82 + k), 0.8 - 0.2 * k), k * 0.035) for k in range(3)]
+    S['Death_Crab'] = mix(*clicks, gain(sweep(180, 90, 0.18, 0.05), 0.6), delay(gain(bubble(420, 0.1), 0.35), 0.06))
+    # piranha: a quick wet splat
+    S['Death_Piranha'] = mix(gain(noise(0.14, 0.03, 2600, seed=85), 0.8), gain(sweep(900, 300, 0.1, 0.03), 0.4), delay(gain(bubble(600, 0.08), 0.4), 0.03))
+    # sea turtle: a heavy hollow thunk and a slow bubble trail
+    S['Death_Turtle'] = mix(gain(sweep(130, 48, 0.5, 0.14), 1.0), gain(noise(0.3, 0.06, 600, seed=86), 0.5),
+                            delay(gain(bubble(300, 0.14), 0.35), 0.12), delay(gain(bubble(380, 0.12), 0.25), 0.24))
+    # manta: a soft whoosh falling away
+    S['Death_Manta'] = mix(gain(noise(0.45, 0.14, 1800, attack=0.06, seed=87), 0.8), gain(sweep(420, 180, 0.45, 0.16, attack=0.05), 0.4))
+    # kraken: a long low roar with a tremble, then a burst of rising bubbles
+    roar = tone(1.6, lambda t: (saw_wave(2 * math.pi * (72 - 26 * t / 1.6) * t) * 0.6 + math.sin(2 * math.pi * 36 * t))
+                * (0.75 + 0.25 * math.sin(2 * math.pi * 9 * t)) * env(t, 0.12, 0.6))
+    S['Death_Kraken'] = mix(gain(lowpass(roar, 700), 1.0), gain(noise(1.4, 0.45, 900, attack=0.1, seed=88), 0.45),
+                            *[delay(gain(bubble(rnd.uniform(250, 700), rnd.uniform(0.08, 0.14)), 0.25), 0.5 + k * 0.09) for k in range(10)])
+    # sea star: a bright sparkling pop
+    S['Death_SeaStar'] = mix(gain(bubble(900, 0.1), 0.6), delay(gain(tone(0.35, lambda t: math.sin(2 * math.pi * 2093 * t) * env(t, 0.002, 0.09)), 0.3), 0.03),
+                             delay(gain(tone(0.3, lambda t: math.sin(2 * math.pi * 2637 * t) * env(t, 0.002, 0.07)), 0.22), 0.08), gain(noise(0.1, 0.02, 5000, seed=89), 0.3))
+    # cuttlefish: an ink squirt, a dark gush that swells and falls, and a bloop
+    S['Death_Cuttlefish'] = mix(gain(lowpass(noise(0.4, 0.12, 1100, attack=0.04, seed=90), 1100), 0.9), gain(sweep(260, 140, 0.3, 0.09), 0.4), delay(gain(bubble(330, 0.13), 0.4), 0.15))
+    # shock eel: a crackling electric zap that fizzles out
+    zap_rnd = random.Random(91)
+    zap = tone(0.35, lambda t: (square(2 * math.pi * (120 + 60 * math.sin(2 * math.pi * 23 * t)) * t) * zap_rnd.uniform(0.4, 1.0)) * env(t, 0.002, 0.08))
+    S['Death_ShockEel'] = mix(gain(lowpass(zap, 4000), 0.5), gain(noise(0.25, 0.04, 7000, seed=92), 0.4))
+    # sea star split: a soft squelch and pop
+    S['Split'] = mix(gain(noise(0.1, 0.025, 1500, seed=93), 0.6), delay(gain(bubble(480, 0.1), 0.6), 0.02))
+    # boss wave: a deep horn chord over a big drum hit, with a dark tritone edge
+    horn = lambda t: (sum(math.sin(2 * math.pi * f * t) / (k + 1) for k, f in enumerate([55.0, 82.41, 110.0, 165.0]))
+                      + 0.25 * math.sin(2 * math.pi * 155.56 * t) * min(1.0, t / 0.6)) * env(t, 0.08, 1.1)
+    drum = mix(gain(sweep(90, 34, 0.9, 0.3), 1.0), gain(noise(0.4, 0.08, 500, seed=94), 0.5))
+    S['BossSting'] = mix(gain(lowpass(tone(2.4, horn), 1200), 0.55), drum, delay(gain(drum, 0.6), 0.75))
+    for name, samples in S.items():
+        write(os.path.join(out, 'S_%s.wav' % name), samples)
+
+
 if __name__ == '__main__':
     # --boss-only <dir> / --tier-unlock-only <dir>: write only that file (a full run rerolls the unseeded Eel shot and ambient music)
-    if len(sys.argv) > 1 and sys.argv[1] == '--boss-only':
+    if len(sys.argv) > 1 and sys.argv[1] == '--extras-only':
+        # creature deaths, split, boss sting and the Kelp / Ruins music sets, without touching the older files
+        d = sys.argv[2] if len(sys.argv) > 2 else 'Saved/SoundSources'
+        os.makedirs(d, exist_ok=True)
+        make_creature_sounds(d)
+        make_kelp_music(d)
+        make_ruins_music(d)
+    elif len(sys.argv) > 1 and sys.argv[1] == '--boss-only':
         make_boss_music(sys.argv[2] if len(sys.argv) > 2 else 'Saved/SoundSources')
     elif len(sys.argv) > 1 and sys.argv[1] == '--tier-unlock-only':
         make_tier_unlock(sys.argv[2] if len(sys.argv) > 2 else 'Saved/SoundSources')
@@ -222,3 +376,6 @@ if __name__ == '__main__':
         make_all(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')
         make_boss_music(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')
         make_tier_unlock(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')
+        make_creature_sounds(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')
+        make_kelp_music(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')
+        make_ruins_music(sys.argv[1] if len(sys.argv) > 1 else 'Saved/SoundSources')

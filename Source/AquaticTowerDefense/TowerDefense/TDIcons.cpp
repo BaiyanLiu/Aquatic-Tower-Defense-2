@@ -1,4 +1,4 @@
-// Aquatic Tower Defense - isometric underwater tower defense with mazing.
+﻿// Aquatic Tower Defense - isometric underwater tower defense with mazing.
 
 #include "TDIcons.h"
 #include "TDRun.h"
@@ -10,7 +10,24 @@
 #include "HAL/FileManager.h"
 #include "Async/ParallelFor.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/Compression.h"
+#include "Misc/Paths.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
+#include "Tasks/Task.h"
+#include "Misc/CoreDelegates.h"
+#include "Misc/ScopeLock.h"
 #include "AquaticTowerDefense.h"
+#include <atomic>
+
+// A hash of this file, TDIcons.h and the TDIconsHD*.inl art, written by AquaticTowerDefense.Build.cs: it keys the painted icon disk
+// cache, so only a change to the icons repaints them (not a rebuild of this file because a neighbour in its unity file changed)
+#if __has_include("TDIconsSourceHash.h")
+#include "TDIconsSourceHash.h"
+#endif
+#ifndef ATD_ICON_SOURCE_HASH
+#define ATD_ICON_SOURCE_HASH __DATE__ " " __TIME__
+#endif
 
 namespace
 {
@@ -257,6 +274,22 @@ namespace
 			FXf Old;
 		};
 
+		/** Like FPlace, but nested inside the current placement instead of replacing it (used by the HD painters) */
+		struct FNest
+		{
+			FNest(FPainter& InP, FV C, float S, float RotDeg = 0.0f) : P(InP), Old(InP.Xf)
+			{
+				const float Cn = FMath::Cos(FMath::DegreesToRadians(RotDeg)), Sn = FMath::Sin(FMath::DegreesToRadians(RotDeg));
+				P.Xf.T = Old.T + FV(Old.Cos * C.X - Old.Sin * C.Y, Old.Sin * C.X + Old.Cos * C.Y) * Old.Scale;
+				P.Xf.Cos = Old.Cos * Cn - Old.Sin * Sn;
+				P.Xf.Sin = Old.Sin * Cn + Old.Cos * Sn;
+				P.Xf.Scale = Old.Scale * S;
+			}
+			~FNest() { P.Xf = Old; }
+			FPainter& P;
+			FXf Old;
+		};
+
 		/** Restores the look at the end of a scope */
 		struct FWith
 		{
@@ -345,6 +378,35 @@ namespace
 			const bool bCatch = bRich && -Deepest > InkPx + 3.5f * Px;
 			const float CatchAt = InkPx + 2.0f * Px;
 			const float CatchWidth = 1.8f * Px;
+			// HD: every lit shape also raises a height field (for contact shadows and crevices in Finish)
+			const bool bDeep = bHD && !bMeasuring;
+			if (bDeep && Height.Num() != Size * Size)
+			{
+				Height.SetNumZeroed(Size * Size);
+			}
+			const float BumpPx = Bevel / Px;
+			// the shape rests on the highest thing it covers, so parts buried under it leave no trace in the field
+			float Base = 0.0f;
+			if (bDeep)
+			{
+				for (const FIntPoint& Block : Active)
+				{
+					const int32 X1 = FMath::Min(Block.X + BlockSize, Size);
+					const int32 Y1 = FMath::Min(Block.Y + BlockSize, Size);
+					for (int32 Y = Block.Y; Y < Y1; ++Y)
+					{
+						for (int32 X = Block.X; X < X1; ++X)
+						{
+							const int32 I = Y * Size + X;
+							if (Depth[I] < 0.0f && (!Mask.Num() || Mask[I] > 0.5f))
+							{
+								Base = FMath::Max(Base, Height[I]);
+							}
+						}
+					}
+				}
+			}
+			const float Lift = Base * 0.6f + 6.0f * Look.Relief;
 
 			for (const FIntPoint& Block : Active)
 			{
@@ -408,10 +470,28 @@ namespace
 							const float W = (K - 1.0f) * 0.8f;
 							Lit = FLinearColor(FMath::Lerp(Color.R, 1.0f, W), FMath::Lerp(Color.G, 1.0f, W), FMath::Lerp(Color.B, 1.0f, W));
 						}
-						const float Gleam = Look.Spec * Look.Relief * FMath::Pow(FMath::Max(FVector3f::DotProduct(N, Half), 0.0f), 42.0f);
+						float Gleam = Look.Spec * Look.Relief * FMath::Pow(FMath::Max(FVector3f::DotProduct(N, Half), 0.0f), 42.0f);
+						if (bDeep)
+						{
+							// a second, tighter highlight lobe reads as a hard wet shine
+							Gleam += Look.Spec * Look.Relief * 0.45f * FMath::Pow(FMath::Max(FVector3f::DotProduct(N, Half), 0.0f), 260.0f);
+						}
 						Lit.R += Gleam;
 						Lit.G += Gleam;
 						Lit.B += Gleam;
+						if (bDeep)
+						{
+							// painterly strokes that follow the shape's contour, plus a fine pore speckle
+							const FV Tangent(-Grad.Y, Grad.X);
+							const float Along = FV::DotProduct(Pixel, Tangent) * 26.0f;
+							const float Across = -D / Px * 0.22f;
+							const float Stroke = Noise2(FV(Across, Along)) * 0.6f + Noise2(FV(Across * 2.1f + 5.3f, Along * 1.7f)) * 0.4f;
+							const float Pore = FMath::Max(0.0f, Noise2(Pixel * 190.0f + FV(1.3f, 7.7f)) - 0.55f) * 2.2f;
+							const float Tex = (0.05f * Stroke - 0.09f * Pore * (0.4f + Look.Grain * 4.0f)) * Look.Relief * (1.0f - Edge * 0.6f);
+							Lit.R *= 1.0f + Tex;
+							Lit.G *= 1.0f + Tex;
+							Lit.B *= 1.0f + Tex * 0.9f;
+						}
 
 						if (bRich)
 						{
@@ -455,6 +535,13 @@ namespace
 						Dst.G = Lit.G * Cover + Dst.G * (1.0f - Cover);
 						Dst.B = Lit.B * Cover + Dst.B * (1.0f - Cover);
 						Dst.A = Cover + Dst.A * (1.0f - Cover);
+						if (bDeep)
+						{
+							// stacked parts sit higher than what they cover; the dome adds its own rounded bump
+							const float Bump = N.Z * BumpPx * 0.55f * Look.Relief;
+							const float Top = Lift + Bump;
+							Height[I] = FMath::Lerp(Height[I], Top, Cover);
+						}
 					}
 				}
 			}
@@ -592,6 +679,14 @@ namespace
 				Mark([=](FV P) { return SdCircle(P, C + FV(-0.36f, -0.4f) * R, R * 0.09f); }, FLinearColor(1.0f, 1.0f, 1.0f, 0.85f * FMath::Min(1.0f, Spec * 1.6f)), 0.004f);
 				Mark([=](FV P) { return FMath::Max(FMath::Abs(SdCircle(P, C, R * 0.8f)) - R * 0.035f, (C.Y + R * 0.25f) - P.Y); }, FLinearColor(1.0f, 1.0f, 1.0f, 0.18f), 0.006f);
 			}
+			if (bHD && !bMeasuring && R * Xf.Scale > 0.02f)
+			{
+				// a reflected window of light from the surface, a dim horizon band and a cool bounce along the bottom
+				const FV W = C + FV(-0.3f, -0.42f) * R;
+				Mark([=](FV P) { return FMath::Max(SdCircle(P, C, R * 0.96f), SdBox(P, W - FV(0.17f, 0.09f) * R, W + FV(0.17f, 0.09f) * R, R * 0.06f)); }, FLinearColor(1.0f, 1.0f, 1.0f, 0.22f * FMath::Min(1.0f, Spec * 1.5f)), R * 0.03f);
+				Mark([=](FV P) { return FMath::Max(SdCircle(P, C, R), FMath::Abs(P.Y - (C.Y + R * 0.12f)) - R * 0.1f); }, FLinearColor(0.0f, 0.02f, 0.05f, 0.12f), R * 0.12f);
+				Mark([=](FV P) { return FMath::Max(FMath::Abs(SdCircle(P, C, R * 0.9f)) - R * 0.06f, (C.Y + R * 0.45f) - P.Y); }, FLinearColor(0.3f, 0.75f, 0.95f, 0.22f), R * 0.06f);
+			}
 		}
 
 		void MCircle(FV C, float R, const FLinearColor& Color) { Mark([=](FV P) { return SdCircle(P, C, R); }, Color); }
@@ -610,10 +705,18 @@ namespace
 		/** Dark rim around everything painted, then converts to straight-alpha sRGB pixels at OutSize */
 		void Finish(TArray<FColor>& Out, float OutlineWidth, int32 OutSize)
 		{
+			if (bHD && Height.Num() == Size * Size)
+			{
+				Deepen();
+			}
 			if (bDetailed && Size >= OutSize * 2 && Size % 2 == 0)
 			{
 				// the detailed canvas is painted at twice the size: average it down first, so the rim below costs the same
 				HalveCanvas();
+			}
+			if (bHD)
+			{
+				RimLight();
 			}
 
 			const int32 R = FMath::Max(1, FMath::RoundToInt(OutlineWidth * Size));
@@ -708,6 +811,130 @@ namespace
 			}
 			Pixels = MoveTemp(Small);
 			Size = Half;
+		}
+
+		/** Box blur of a float field with a running sum, Passes times (two or three passes approximate a gaussian) */
+		static void BlurField(TArray<float>& F, int32 N, int32 Radius, int32 Passes)
+		{
+			TArray<float> Tmp;
+			Tmp.SetNumUninitialized(N * N);
+			const float Inv = 1.0f / (2 * Radius + 1);
+			for (int32 Pass = 0; Pass < Passes; ++Pass)
+			{
+				for (int32 Y = 0; Y < N; ++Y)
+				{
+					float Sum = 0.0f;
+					for (int32 K = -Radius; K <= Radius; ++K)
+					{
+						Sum += F[Y * N + FMath::Clamp(K, 0, N - 1)];
+					}
+					for (int32 X = 0; X < N; ++X)
+					{
+						Tmp[Y * N + X] = Sum * Inv;
+						Sum += F[Y * N + FMath::Min(X + Radius + 1, N - 1)] - F[Y * N + FMath::Max(X - Radius, 0)];
+					}
+				}
+				for (int32 X = 0; X < N; ++X)
+				{
+					float Sum = 0.0f;
+					for (int32 K = -Radius; K <= Radius; ++K)
+					{
+						Sum += Tmp[FMath::Clamp(K, 0, N - 1) * N + X];
+					}
+					for (int32 Y = 0; Y < N; ++Y)
+					{
+						F[Y * N + X] = Sum * Inv;
+						Sum += Tmp[FMath::Min(Y + Radius + 1, N - 1) * N + X] - Tmp[FMath::Max(Y - Radius, 0) * N + X];
+					}
+				}
+			}
+		}
+
+		/**
+		 *  HD finish on the full canvas: contact shadows where a part meets a taller neighbour (from the height field),
+		 *  dark crevices along every seam, light catching the raised edges of stacked parts, and soft caustic light
+		 *  from the surface rippling over the upper half of the icon.
+		 */
+		void Deepen()
+		{
+			const int32 N = Size * Size;
+			const float Px = Size / 512.0f;
+			TArray<float> Wide = Height, Tight = Height, Soft = Height;
+			BlurField(Wide, Size, FMath::Max(2, FMath::RoundToInt(9.0f * Px)), 2);
+			BlurField(Tight, Size, FMath::Max(1, FMath::RoundToInt(2.0f * Px)), 2);
+			BlurField(Soft, Size, FMath::Max(1, FMath::RoundToInt(1.5f * Px)), 1);
+			const float InvSize = 1.0f / Size;
+			const FLinearColor Caustic = Hex(0xC8F6FF);
+			for (int32 Y = 1; Y + 1 < Size; ++Y)
+			{
+				for (int32 X = 1; X + 1 < Size; ++X)
+				{
+					const int32 I = Y * Size + X;
+					FLinearColor& Dst = Pixels[I];
+					if (Dst.A < 0.02f)
+					{
+						continue;
+					}
+					const float H = Height[I];
+					// ambient occlusion and crevices
+					const float Occl = FMath::Clamp((Wide[I] - H) / 14.0f, 0.0f, 1.0f) * 0.5f + FMath::Clamp((Tight[I] - H) / 5.0f, 0.0f, 1.0f) * 0.32f;
+					// the slope of the stacked surface: raised edges facing the light brighten, those facing away darken
+					const float GX = (Soft[I + 1] - Soft[I - 1]) / (2.0f * Px);
+					const float GY = (Soft[I + Size] - Soft[I - Size]) / (2.0f * Px);
+					const float Facing = FMath::Clamp((GX * 0.55f + GY * 0.8f) * 0.03f, -0.12f, 0.12f);
+					float K = (1.0f - Occl) * (1.0f + Facing);
+					Dst.R *= K * (1.0f - Occl * 0.25f);	// occlusion leans blue-green, like deep water
+					Dst.G *= K * (1.0f - Occl * 0.08f);
+					Dst.B *= K;
+
+					// caustics: two layers of ridged noise, strongest near the top and on surfaces facing up
+					const FV Q((X + 0.5f) * InvSize, (Y + 0.5f) * InvSize);
+					const FV W = Q * 7.5f + FV(Noise2(Q * 3.0f) * 0.6f, Noise2(Q * 3.0f + FV(4.2f, 1.7f)) * 0.6f);
+					const float R1 = 1.0f - FMath::Abs(Noise2(W));
+					const float R2 = 1.0f - FMath::Abs(Noise2(W * 1.6f + FV(3.1f, 8.4f)));
+					const float Web = FMath::Pow(R1 * R2, 7.0f);
+					const float Up = FMath::Clamp(1.15f - Q.Y * 1.25f, 0.0f, 1.0f) * FMath::Clamp(0.7f - GY * 0.05f, 0.3f, 1.0f);
+					const float C = Web * Up * 0.16f * Dst.A;
+					Dst.R += Caustic.R * C;
+					Dst.G += Caustic.G * C;
+					Dst.B += Caustic.B * C;
+				}
+			}
+		}
+
+		/** HD: a cool rim light along the lower right of the silhouette and a pale surface light along its top left */
+		void RimLight()
+		{
+			const int32 N = Size * Size;
+			const float Px = Size / 512.0f;
+			TArray<float> A;
+			A.SetNumUninitialized(N);
+			for (int32 i = 0; i < N; ++i)
+			{
+				A[i] = Pixels[i].A;
+			}
+			BlurField(A, Size, FMath::Max(1, FMath::RoundToInt(1.5f * Px)), 2);
+			const int32 OX = FMath::Max(1, FMath::RoundToInt(3.0f * Px));
+			const int32 OY = FMath::Max(1, FMath::RoundToInt(4.0f * Px));
+			const FLinearColor Cool = Hex(0x62E0FF);
+			const FLinearColor Pale = Hex(0xFFF6E0);
+			auto At = [&A, this](int32 X, int32 Y) { return A[FMath::Clamp(Y, 0, Size - 1) * Size + FMath::Clamp(X, 0, Size - 1)]; };
+			for (int32 Y = 0; Y < Size; ++Y)
+			{
+				for (int32 X = 0; X < Size; ++X)
+				{
+					FLinearColor& Dst = Pixels[Y * Size + X];
+					if (Dst.A < 0.5f)
+					{
+						continue;
+					}
+					const float Back = FMath::Clamp(1.0f - At(X + OX, Y + OY) * 1.15f, 0.0f, 1.0f) * 0.3f;
+					const float Front = FMath::Clamp(1.0f - At(X - OX, Y - OY) * 1.15f, 0.0f, 1.0f) * 0.14f;
+					Dst.R += (Cool.R * Back + Pale.R * Front) * Dst.A;
+					Dst.G += (Cool.G * Back + Pale.G * Front) * Dst.A;
+					Dst.B += (Cool.B * Back + Pale.B * Front) * Dst.A;
+				}
+			}
 		}
 
 		/** Detailed finish: a light unsharp mask for crisper surface detail, and a little more colour */
@@ -841,6 +1068,11 @@ namespace
 		bool bDetailed = false;
 		bool bDropShadow = true;
 
+		/** HD look (atd.DetailedIcons 2): painted at four times the size, with a height field for contact shadows and
+		 *  crevices, contour brush strokes and pores, caustic light from the surface, a cool rim light and a hard wet shine */
+		bool bHD = false;
+		TArray<float> Height;
+
 	private:
 		/** Visits every pixel of the blocks a shape can reach, with its signed distance in pixels. Most shapes touch few blocks. */
 		template <typename FVisit>
@@ -886,6 +1118,7 @@ namespace
 	};
 
 	using FPlace = FPainter::FPlace;
+	using FNest = FPainter::FNest;
 	using FWith = FPainter::FWith;
 	using FClip = FPainter::FClip;
 
@@ -921,6 +1154,84 @@ namespace
 		return FV(V.X * C - V.Y * S, V.X * S + V.Y * C);
 	}
 
+	// ---- HD detail motifs (painted only by the HD tier; call them inside a clip) ----
+
+	/** Repeatable random number in 0..1 */
+	float Rand01(int32 Seed, int32 I)
+	{
+		uint32 H = (uint32)(Seed * 9781 + I * 6271 + 13) * 2654435761u;
+		H ^= H >> 15;
+		H *= 2246822519u;
+		H ^= H >> 13;
+		return (float)(H & 0xFFFFFF) / 16777215.0f;
+	}
+
+	/** Scattered dots of varying size in a box */
+	void Speckle(FPainter& P, FV Min, FV Max, int32 Count, float R0, float R1, const FLinearColor& Color, int32 Seed)
+	{
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const FV At(FMath::Lerp(Min.X, Max.X, Rand01(Seed, i * 3)), FMath::Lerp(Min.Y, Max.Y, Rand01(Seed, i * 3 + 1)));
+			const float K = Rand01(Seed, i * 3 + 2);
+			P.MCircle(At, FMath::Lerp(R0, R1, K), Alpha(Color, Color.A * (0.55f + 0.45f * K)));
+		}
+	}
+
+	/** Little hollows with a dark pocket and a lit lower lip, for rock, coral and old metal */
+	void Pits(FPainter& P, FV Min, FV Max, int32 Count, float R, const FLinearColor& Dark, int32 Seed)
+	{
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const FV At(FMath::Lerp(Min.X, Max.X, Rand01(Seed, i * 3)), FMath::Lerp(Min.Y, Max.Y, Rand01(Seed, i * 3 + 1)));
+			const float Rr = R * (0.55f + 0.7f * Rand01(Seed, i * 3 + 2));
+			P.MEllipse(At, Rr, Rr * 0.72f, Dark, Rr * 0.25f);
+			P.MArc(At, Rr * 0.95f, Rr * 0.32f, 30.0f, 150.0f, Hex(0xFFFFFF, 0.32f));
+		}
+	}
+
+	/** Overlapping scales in staggered rows; arcs open towards OpenDeg (0 = right) */
+	void Scales(FPainter& P, FV Min, FV Max, float Step, float OpenDeg, const FLinearColor& Line, const FLinearColor& Shine)
+	{
+		int32 Row = 0;
+		for (float Y = Min.Y; Y <= Max.Y; Y += Step * 0.62f, ++Row)
+		{
+			for (float X = Min.X + (Row % 2) * Step * 0.5f; X <= Max.X; X += Step)
+			{
+				const FV C(X, Y);
+				P.MArc(C, Step * 0.55f, Step * 0.09f, OpenDeg + 100.0f, OpenDeg + 260.0f, Line);
+				P.MArc(C + Spin(FV(Step * 0.08f, 0.0f), OpenDeg), Step * 0.42f, Step * 0.06f, OpenDeg + 130.0f, OpenDeg + 200.0f, Shine);
+			}
+		}
+	}
+
+	/** A jagged crack with a lit edge just below it */
+	void Crack(FPainter& P, const TArray<FV>& Pts, float W, const FLinearColor& Dark)
+	{
+		TArray<FV> Lit;
+		for (const FV& Pt : Pts)
+		{
+			Lit.Add(Pt + FV(W * 0.8f, W * 1.4f));
+		}
+		P.MLine(Lit, W * 0.6f, Hex(0xFFFFFF, 0.28f));
+		P.MLine(Pts, W, Dark);
+	}
+
+	/** Fine parallel hair lines along a direction across a box (wood grain, fin rays, brushed metal) */
+	void Strands(FPainter& P, FV A, FV B, float Spread, int32 Count, float W, const FLinearColor& Color, int32 Seed, float Wobble = 0.01f)
+	{
+		const FV D = (B - A).GetSafeNormal();
+		const FV N(-D.Y, D.X);
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const float O = FMath::Lerp(-Spread, Spread, (i + 0.5f) / Count) + (Rand01(Seed, i) - 0.5f) * Spread / Count;
+			const float W0 = Wobble * (Rand01(Seed, i + 50) - 0.5f) * 2.0f;
+			P.MLine(Smooth({ A + N * O, (A + B) * 0.5f + N * (O + W0), B + N * (O - W0 * 0.5f) }), W * (0.6f + 0.6f * Rand01(Seed, i + 99)), Alpha(Color, Color.A * (0.5f + 0.5f * Rand01(Seed, i + 7))));
+		}
+	}
+
+	/** A tiny bubble trail rising to the upper right */
+	void BubbleTrail(FPainter& P, FV From, int32 Count, float R, int32 Seed);
+
 	// ---- motifs, drawn around a local origin with unit size about 1 ----
 
 	/** The round stone platform towers stand on, top surface centred at (Cx, Y) */
@@ -936,6 +1247,33 @@ namespace
 			P.Ellipse(FV(Cx, Y), Rx, Ry, Hex(0x9AA6A8));
 		}
 		P.Mark([=](FV Q) { return FMath::Abs(SdEllipse(Q, FV(Cx, Y), Rx * 0.8f, Ry * 0.78f)) - 0.004f; }, Hex(0x5E6A70, 0.7f));
+		if (P.bHD)
+		{
+			// weathered stone: grit, chips and hairline cracks on the top, worn grit and moss on the side band
+			{
+				FClip Clip(P, [=](FV Q) { return SdEllipse(Q, FV(Cx, Y), Rx, Ry); });
+				Speckle(P, FV(Cx - Rx, Y - Ry), FV(Cx + Rx, Y + Ry), 70, 0.002f, 0.006f, Hex(0x4E5A60, 0.75f), 11);
+				Speckle(P, FV(Cx - Rx, Y - Ry), FV(Cx + Rx, Y + Ry), 45, 0.002f, 0.005f, Hex(0xE4ECEE, 0.6f), 12);
+				Crack(P, { FV(Cx - Rx * 0.62f, Y - Ry * 0.1f), FV(Cx - Rx * 0.5f, Y + Ry * 0.12f), FV(Cx - Rx * 0.36f, Y + Ry * 0.08f), FV(Cx - Rx * 0.3f, Y + Ry * 0.4f) }, 0.0028f, Hex(0x3E484E, 0.85f));
+				Crack(P, { FV(Cx + Rx * 0.66f, Y - Ry * 0.3f), FV(Cx + Rx * 0.54f, Y + Ry * 0.02f), FV(Cx + Rx * 0.6f, Y + Ry * 0.3f) }, 0.0025f, Hex(0x3E484E, 0.85f));
+				P.MEllipse(FV(Cx - Rx * 0.25f, Y - Ry * 0.35f), Rx * 0.45f, Ry * 0.22f, Hex(0xFFFFFF, 0.14f), Ry * 0.3f);
+			}
+			{
+				FClip Clip(P, [=](FV Q) { return FMath::Max(FMath::Min(SdEllipse(Q, FV(Cx, Y + H), Rx, Ry), SdBox(Q, FV(Cx - Rx, Y), FV(Cx + Rx, Y + H), 0.0f)), -SdEllipse(Q, FV(Cx, Y), Rx, Ry)); });
+				Speckle(P, FV(Cx - Rx, Y), FV(Cx + Rx, Y + H + Ry), 60, 0.002f, 0.005f, Hex(0x2E383E, 0.7f), 13);
+				for (int32 i = 0; i < 9; ++i)
+				{
+					const float X = Cx - Rx * 0.9f + i * Rx * 0.225f;
+					P.MCapsule(FV(X, Y + Ry * 0.5f), FV(X + 0.004f, Y + H + Ry * 0.6f), 0.0025f, Hex(0x3C464C, 0.55f));
+				}
+				for (const float U : { -0.78f, -0.3f, 0.42f, 0.8f })
+				{
+					const FV At(Cx + Rx * U, Y + Ry * FMath::Sqrt(FMath::Max(0.0f, 1.0f - U * U)) + 0.004f);
+					P.MEllipse(At, 0.03f, 0.012f, Hex(0x3E8A3C, 0.95f), 0.004f);
+					P.MEllipse(At + FV(-0.006f, -0.004f), 0.018f, 0.005f, Hex(0x9EDC78, 0.8f), 0.003f);
+				}
+			}
+		}
 	}
 
 	/** A short twisted rope, with its strands drawn across it */
@@ -950,11 +1288,23 @@ namespace
 		{
 			const FV C = FMath::Lerp(A, B, (i + 0.5f) / Count);
 			P.MCapsule(C - N * R * 0.75f - D * R * 0.3f, C + N * R * 0.75f + D * R * 0.3f, R * 0.17f, Hex(0x7E5C30, 0.8f));
+			if (P.bHD)
+			{
+				// loose fibres and a lit top on each strand
+				P.MCapsule(C - N * R * 0.55f - D * R * 0.75f, C + N * R * 0.2f - D * R * 0.45f, R * 0.06f, Hex(0x5E4220, 0.6f));
+				P.MCapsule(C - N * R * 0.6f + D * R * 0.15f, C - N * R * 0.1f + D * R * 0.35f, R * 0.09f, Hex(0xFFF2D0, 0.55f));
+			}
 		}
 	}
 
 	void Rivet(FPainter& P, FV C, float R)
 	{
+		if (P.bHD)
+		{
+			// a dark seat and a rust tear under each rivet
+			P.MCircle(C + FV(R * 0.15f, R * 0.25f), R * 1.35f, Hex(0x1E262C, 0.55f));
+			P.MCapsule(C + FV(0.0f, R * 0.8f), C + FV(R * 0.1f, R * 2.6f), R * 0.28f, Hex(0x9A5A2E, 0.45f));
+		}
 		P.Ball(C, R, Hex(0xC4CDD2), 0.8f);
 	}
 
@@ -966,6 +1316,17 @@ namespace
 		P.MCircle(C + FV(R * 0.38f, R * 0.4f), R * 0.1f, Hex(0xFFFFFF, 0.7f));
 	}
 
+	void BubbleTrail(FPainter& P, FV From, int32 Count, float R, int32 Seed)
+	{
+		FV At = From;
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const float Rr = R * (0.6f + 0.4f * i / FMath::Max(1, Count - 1)) * (0.8f + 0.4f * Rand01(Seed, i));
+			Bubble(P, At, Rr);
+			At += FV((Rand01(Seed, i + 20) - 0.3f) * R * 2.0f, -R * (2.6f + Rand01(Seed, i + 40) * 1.4f));
+		}
+	}
+
 	void Drop(FPainter& P, FV C, float S, const FLinearColor& Color, float Rot = 0.0f)
 	{
 		FPlace Place(P, C, S, Rot);
@@ -973,12 +1334,22 @@ namespace
 		P.Look.Dome = 10.0f;
 		P.Look.Spec = 0.8f;
 		const TArray<FV> Tip = { FV(0.0f, -0.48f), FV(0.27f, 0.02f), FV(-0.27f, 0.02f) };
-		auto Shape = [&Tip](FV Q) { return FMath::Min(SdCircle(Q, FV(0.0f, 0.14f), 0.3f), SdPoly(Q, Tip)); };
+		const TArray<FV> Tear = Smooth({ FV(0.0f, -0.5f), FV(0.07f, -0.33f), FV(0.2f, -0.12f), FV(0.29f, 0.08f), FV(0.27f, 0.3f), FV(0.13f, 0.43f), FV(0.0f, 0.45f), FV(-0.13f, 0.43f), FV(-0.27f, 0.3f), FV(-0.29f, 0.08f), FV(-0.2f, -0.12f), FV(-0.07f, -0.33f) }, true, 6);
+		const bool bHD = P.bHD;
+		auto Shape = [&Tip, &Tear, bHD](FV Q) { return bHD ? SdPoly(Q, Tear) : FMath::Min(SdCircle(Q, FV(0.0f, 0.14f), 0.3f), SdPoly(Q, Tip)); };
 		P.Fill(Shape, Color);
 		FClip Clip(P, Shape);
 		P.MEllipse(FV(0.06f, 0.27f), 0.2f, 0.09f, Alpha(Tone(Color, 1.7f), 0.5f), 0.04f);
 		P.Gloss(FV(-0.11f, 0.08f), 0.055f, 0.11f, 0.8f);
 		P.Gloss(FV(-0.05f, -0.18f), 0.02f, 0.05f, 0.5f);
+		if (P.bHD)
+		{
+			// refracted light pooling at the bottom, a trapped bubble and a thin bright rim
+			P.MArc(FV(0.0f, 0.14f), 0.26f, 0.025f, 20.0f, 160.0f, Alpha(Tone(Color, 2.2f), 0.55f));
+			P.MCircle(FV(0.1f, 0.0f), 0.035f, Hex(0xFFFFFF, 0.25f));
+			P.Mark([](FV Q) { return FMath::Abs(SdCircle(Q, FV(0.1f, 0.0f), 0.035f)) - 0.006f; }, Hex(0xFFFFFF, 0.6f));
+			P.Mark([&Shape](FV Q) { return FMath::Abs(Shape(Q) + 0.018f) - 0.006f; }, Hex(0xFFFFFF, 0.22f));
+		}
 	}
 
 	void Bolt(FPainter& P, FV C, float S, const FLinearColor& Color, float Rot = 0.0f)
@@ -988,6 +1359,21 @@ namespace
 		P.Glow([&Pts](FV Q) { return SdPoly(Q, Pts); }, Alpha(Tone(Color, 0.75f), 1.0f), 0.1f, 0.55f);
 		P.Poly(Pts, Color);
 		P.MPoly({ FV(0.07f, -0.34f), FV(-0.15f, 0.02f), FV(-0.04f, 0.02f), FV(0.03f, -0.14f) }, Hex(0xFFFFFF, 0.65f));
+		if (P.bHD)
+		{
+			// a white-hot core line and tiny sparks
+			{
+				// the hot core stays inside the bolt instead of running past its edges
+				FClip Clip(P, [&Pts](FV Q) { return SdPoly(Q, Pts) + 0.03f; });
+				P.MLine({ FV(0.1f, -0.44f), FV(-0.18f, 0.04f), FV(0.0f, 0.06f), FV(-0.1f, 0.44f) }, 0.012f, Hex(0xFFFFF0, 0.85f));
+			}
+			for (int32 i = 0; i < 4; ++i)
+			{
+				const FV At(0.3f - i * 0.18f, -0.3f + i * 0.2f);
+				P.Glow([At](FV Q) { return SdCircle(Q, At, 0.012f); }, Hex(0xFFE060), 0.04f, 0.6f);
+				P.MCircle(At, 0.012f, Hex(0xFFFFE0));
+			}
+		}
 	}
 
 	void Plus(FPainter& P, FV C, float S, const FLinearColor& Color)
@@ -1067,12 +1453,35 @@ namespace
 			const float W = (i % 2) ? -1.0f : 1.0f;
 			const TArray<FV> Path = Smooth({ FV(X, 0.03f), FV(X + W * 0.05f, 0.15f), FV(X - W * 0.04f, 0.28f), FV(X + W * 0.04f, 0.41f), FV(X - W * 0.01f, 0.52f) });
 			P.Ribbon(Path, 0.024f, 0.01f, Alpha(Tone(Solid, 0.82f), 1.0f));
+			if (P.bHD)
+			{
+				// stinging cells beaded down each tentacle
+				for (int32 k = 1; k < 9; ++k)
+				{
+					FV Pos, Tan;
+					Along(Path, k / 9.0f, Pos, Tan);
+					P.MCircle(Pos + FV(-Tan.Y, Tan.X) * 0.006f, FMath::Lerp(0.007f, 0.003f, k / 9.0f), Alpha(Light, 0.95f));
+				}
+			}
 		}
 		for (int32 i = 0; i < 2; ++i)
 		{
 			const float X = i ? 0.075f : -0.075f;
 			const TArray<FV> Path = Smooth({ FV(X, 0.03f), FV(X * 1.4f, 0.14f), FV(X * 0.7f, 0.25f), FV(X * 1.3f, 0.36f) });
 			P.Ribbon(Path, 0.042f, 0.014f, Light);
+			if (P.bHD)
+			{
+				// ruffled frills along the oral arm
+				FClip Clip(P, [&Path](FV Q) { return SdRibbon(Q, Path, 0.042f, 0.014f); });
+				for (int32 k = 0; k < 12; ++k)
+				{
+					FV Pos, Tan;
+					Along(Path, k / 12.0f, Pos, Tan);
+					const FV Nrm(-Tan.Y, Tan.X);
+					P.MArc(Pos + Nrm * 0.02f, 0.016f, 0.004f, 0.0f, 360.0f, Alpha(Deep, 0.45f));
+					P.MArc(Pos - Nrm * 0.02f, 0.013f, 0.003f, 0.0f, 360.0f, Alpha(White, 0.5f));
+				}
+			}
 		}
 
 		{
@@ -1100,6 +1509,24 @@ namespace
 			P.MCircle(FV(-0.315f + i * 0.09f, 0.03f), 0.04f, Alpha(Deep, 0.85f));
 			P.MCircle(FV(-0.315f + i * 0.09f, 0.02f), 0.024f, Alpha(Light, 0.9f));
 		}
+		if (P.bHD)
+		{
+			// radial canals and a ring canal, a mesh of fine veins, glowing dots along the rim and a second rim highlight
+			for (int32 i = 0; i < 16; ++i)
+			{
+				const float A = 190.0f + i * 10.7f;
+				const FV Dir = Spin(FV(1.0f, 0.0f), A);
+				P.MLine(Smooth({ FV(0.0f, -0.05f) + Dir * 0.12f, FV(0.0f, -0.02f) + FV(Dir.X * 0.26f, Dir.Y * 0.28f), FV(0.0f, 0.04f) + FV(Dir.X * 0.35f, Dir.Y * 0.37f) }), 0.0028f, Alpha(Deep, 0.4f));
+			}
+			P.Mark([](FV Q) { return FMath::Abs(SdEllipse(Q, FV(0.0f, 0.04f), 0.3f, 0.32f)) - 0.003f; }, Alpha(White, 0.35f));
+			Speckle(P, FV(-0.34f, -0.34f), FV(0.34f, 0.02f), 40, 0.003f, 0.007f, Alpha(White, 0.45f), 61);
+			for (int32 i = 0; i < 14; ++i)
+			{
+				const float X = -0.32f + i * 0.049f;
+				P.MCircle(FV(X, 0.0f), 0.006f, Hex(0xFFF0FA, 0.95f));
+			}
+			P.MArc(FV(0.0f, 0.04f), 0.33f, 0.012f, 200.0f, 250.0f, Alpha(White, 0.55f));
+		}
 		P.Gloss(FV(-0.15f, -0.21f), 0.1f, 0.05f, 0.85f);
 		P.Gloss(FV(0.17f, -0.2f), 0.025f, 0.02f, 0.6f);
 	}
@@ -1113,9 +1540,10 @@ namespace
 		{
 			const float F = (float)Side;
 			P.Blob({ FV(F * 0.26f, 0.03f), FV(F * 0.46f, -0.05f), FV(F * 0.5f, 0.06f), FV(F * 0.42f, 0.14f), FV(F * 0.27f, 0.12f) }, Hex(0xF0A030));
-			for (int32 i = 0; i < 3; ++i)
+			for (int32 i = 0; i < (P.bHD ? 7 : 3); ++i)
 			{
-				P.MCapsule(FV(F * 0.3f, 0.07f), FV(F * 0.45f, -0.02f + i * 0.06f), 0.006f, Hex(0x9A5A14, 0.8f));
+				const float T = P.bHD ? i / 2.0f : (float)i;
+				P.MCapsule(FV(F * 0.3f, 0.07f), FV(F * 0.45f, -0.02f + T * 0.06f), P.bHD ? 0.0035f : 0.006f, Hex(0x9A5A14, 0.8f));
 			}
 		}
 		for (int32 i = 0; i < 18; ++i)
@@ -1123,6 +1551,12 @@ namespace
 			const FV Dir = Spin(FV(1.0f, 0.0f), i * 20.0f + 10.0f);
 			const FV Perp(-Dir.Y, Dir.X);
 			P.Poly({ Dir * (0.33f + SpikeLength), Dir * 0.28f + Perp * 0.05f, Dir * 0.28f - Perp * 0.05f }, Hex(0xD2A234));
+			if (P.bHD)
+			{
+				// a lit ridge down each spine and a darker tip
+				P.MLine({ Dir * 0.29f + Perp * 0.012f, Dir * (0.32f + SpikeLength * 0.9f) }, 0.004f, Hex(0xFFF0B0, 0.75f));
+				P.MPoly({ Dir * (0.33f + SpikeLength), Dir * (0.31f + SpikeLength * 0.6f) + Perp * 0.012f, Dir * (0.31f + SpikeLength * 0.6f) - Perp * 0.012f }, Hex(0x7A5410, 0.8f));
+			}
 		}
 		const auto Body = [](FV Q) { return SdCircle(Q, FV(0.0f, 0.0f), 0.34f); };
 		{
@@ -1139,6 +1573,18 @@ namespace
 			{
 				P.MCircle(Spot, 0.024f, Hex(0x9A6A18, 0.85f));
 			}
+			if (P.bHD)
+			{
+				// fine leopard rosettes over the back, a speckled belly and lit spine sockets
+				Speckle(P, FV(-0.32f, -0.32f), FV(0.32f, 0.1f), 60, 0.004f, 0.011f, Hex(0xB07A1C, 0.7f), 71);
+				Speckle(P, FV(-0.3f, 0.12f), FV(0.3f, 0.32f), 30, 0.003f, 0.006f, Hex(0xE8C870, 0.8f), 72);
+				for (int32 i = 0; i < 18; ++i)
+				{
+					const FV Dir = Spin(FV(1.0f, 0.0f), i * 20.0f + 10.0f);
+					P.MCircle(Dir * 0.315f, 0.016f, Hex(0x9A6A18, 0.55f));
+					P.MCircle(Dir * 0.31f + FV(-0.004f, -0.005f), 0.007f, Hex(0xFFF6C8, 0.7f));
+				}
+			}
 			// little belly spines
 			for (int32 i = 0; i < 5; ++i)
 			{
@@ -1152,6 +1598,17 @@ namespace
 			P.Ball(FV(F * 0.14f, -0.06f), 0.095f, White, 0.2f);
 			P.Ball(FV(F * 0.125f, -0.05f), 0.055f, Hex(0x18242C), 0.9f);
 			P.MCircle(FV(F * 0.125f - 0.018f, -0.07f), 0.015f, Hex(0xFFFFFF, 0.95f));
+			if (P.bHD)
+			{
+				// iris ring, veins in the white and a lower catch light
+				P.Mark([F](FV Q) { return FMath::Abs(SdCircle(Q, FV(F * 0.125f, -0.05f), 0.05f)) - 0.004f; }, Hex(0x3A7A9A, 0.85f));
+				for (int32 k = 0; k < 3; ++k)
+				{
+					const FV Dir = Spin(FV(F, 0.0f), (k - 1) * 30.0f);
+					P.MLine({ FV(F * 0.14f, -0.06f) + Dir * 0.09f, FV(F * 0.14f, -0.06f) + Dir * 0.07f + FV(0.0f, 0.006f) }, 0.0018f, Hex(0xE07070, 0.55f));
+				}
+				P.MCircle(FV(F * 0.125f + 0.022f, -0.025f), 0.007f, Hex(0xFFFFFF, 0.7f));
+			}
 			P.MCapsule(FV(F * 0.05f, -0.15f), FV(F * 0.23f, -0.18f), 0.012f, Hex(0xB57E20, 0.95f));
 		}
 		// pouted lips
@@ -1211,21 +1668,6 @@ namespace
 			P.MCapsule(FV(-0.34f, Y), FV(-0.1f, Y + 0.05f), 0.011f, Hex(0x8A7A5C));
 			P.MCapsule(FV(0.1f, Y + 0.05f), FV(0.34f, Y), 0.011f, Hex(0x8A7A5C));
 		}
-	}
-
-	void Clock(FPainter& P, FV C, float S)
-	{
-		FPlace Place(P, C, S);
-		P.Ball(FV(0.0f, 0.0f), 0.47f, Hex(0x3C7FA0));
-		P.Circle(FV(0.0f, 0.0f), 0.37f, Hex(0xF0F6F8));
-		for (int32 i = 0; i < 12; ++i)
-		{
-			const FV Dir = Spin(FV(1.0f, 0.0f), i * 30.0f);
-			P.MCapsule(Dir * 0.3f, Dir * 0.34f, i % 3 ? 0.008f : 0.014f, Alpha(Ink, 0.8f));
-		}
-		P.MCapsule(FV(0.0f, 0.0f), FV(0.0f, -0.25f), 0.03f, Ink);
-		P.MCapsule(FV(0.0f, 0.0f), FV(0.17f, 0.07f), 0.03f, Ink);
-		P.MCircle(FV(0.0f, 0.0f), 0.04f, Blood);
 	}
 
 	void Eye(FPainter& P, FV C, float S)
@@ -1315,14 +1757,43 @@ namespace
 		P.Gloss(C + FV(-R * 0.32f, -R * 0.38f), R * 0.3f, R * 0.2f, 0.95f);
 		P.Gloss(C + FV(-R * 0.08f, -R * 0.6f), R * 0.08f, R * 0.05f, 0.7f);
 		P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.82f, R * 0.08f, 20.0f, 95.0f); }, Hex(0xFFFFFF, 0.5f), R * 0.06f);
+		if (P.bHD)
+		{
+			// nacre: fine concentric growth lines and a soft rainbow orient shifting across the surface
+			for (int32 k = 1; k < 7; ++k)
+			{
+				P.Mark([C, R, k](FV Q) { return FMath::Abs(SdEllipse(Q, C + FV(R * 0.18f, R * 0.22f), R * (0.16f * k), R * (0.14f * k))) - R * 0.006f; }, Hex(0xFFFFFF, 0.05f));
+			}
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.7f, R * 0.12f, 120.0f, 200.0f); }, Hex(0x9AF0C8, 0.22f), R * 0.08f);
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.6f, R * 0.1f, 300.0f, 380.0f); }, Hex(0xFFB0E0, 0.22f), R * 0.08f);
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.85f, R * 0.06f, 60.0f, 110.0f); }, Hex(0xB0C8FF, 0.3f), R * 0.05f);
+		}
 	}
 
 	void Heart(FPainter& P, FV C, float S, const FLinearColor& Color)
 	{
 		FPlace Place(P, C, S);
 		const TArray<FV> Tip = { FV(-0.4f, -0.04f), FV(0.4f, -0.04f), FV(0.0f, 0.42f) };
-		const auto Shape = [&Tip](FV Q)
+		// HD: one smooth outline traced from the classic heart curve, so the lobes and point are a single shape
+		TArray<FV> Outline;
+		if (P.bHD)
 		{
+			for (int32 k = 0; k < 96; ++k)
+			{
+				const float T = k * 2.0f * PI / 96.0f;
+				const float Sn = FMath::Sin(T);
+				const float X = 16.0f * Sn * Sn * Sn;
+				const float Y = -(13.0f * FMath::Cos(T) - 5.0f * FMath::Cos(2.0f * T) - 2.0f * FMath::Cos(3.0f * T) - FMath::Cos(4.0f * T));
+				Outline.Add(FV(X, Y + 0.5f) * (0.82f / 32.0f));
+			}
+		}
+		const bool bSmooth = P.bHD;
+		const auto Shape = [&Tip, &Outline, bSmooth](FV Q)
+		{
+			if (bSmooth)
+			{
+				return SdPoly(Q, Outline);
+			}
 			return FMath::Min(FMath::Min(SdCircle(Q, FV(-0.2f, -0.12f), 0.22f), SdCircle(Q, FV(0.2f, -0.12f), 0.22f)), SdPoly(Q, Tip));
 		};
 		FWith With(P);
@@ -1331,6 +1802,13 @@ namespace
 		P.Fill(Shape, Color);
 		FClip Clip(P, Shape);
 		P.MEllipse(FV(0.1f, 0.2f), 0.26f, 0.14f, Alpha(Tone(Color, 0.4f), 0.4f), 0.06f);
+		if (P.bHD)
+		{
+			// a crease down the middle, a velvet speckle and a glassy inner rim
+			P.Mark([](FV Q) { return SdCapsule(Q, FV(0.0f, -0.22f), FV(0.005f, -0.1f), 0.004f); }, Alpha(Tone(Color, 0.55f), 0.4f), 0.03f);
+			Speckle(P, FV(-0.42f, -0.34f), FV(0.42f, 0.42f), 60, 0.003f, 0.007f, Alpha(Tone(Color, 1.4f), 0.4f), 321);
+			P.Mark([&Shape](FV Q) { return FMath::Abs(Shape(Q) + 0.03f) - 0.007f; }, Hex(0xFFFFFF, 0.2f));
+		}
 		P.Gloss(FV(-0.22f, -0.2f), 0.09f, 0.055f, 0.85f);
 		P.Gloss(FV(0.17f, -0.24f), 0.03f, 0.02f, 0.6f);
 	}
@@ -1372,13 +1850,53 @@ namespace
 			P.MEllipse(FV(0.86f, 0.62f), 0.1f, 0.05f, Hex(0x4CA848, 0.95f), 0.012f);
 			P.MEllipse(FV(0.14f, 0.6f), 0.06f, 0.022f, Hex(0x96DC70, 0.8f), 0.01f);
 			P.MEllipse(FV(0.85f, 0.6f), 0.06f, 0.022f, Hex(0x96DC70, 0.8f), 0.01f);
+			if (P.bHD)
+			{
+				// porous reef rock: pits, grit, hairline cracks, encrusting coralline algae and moss tufts
+				Pits(P, FV(0.1f, 0.5f), FV(0.92f, 0.92f), 34, 0.012f, Hex(0x2E2220, 0.85f), 21);
+				Speckle(P, FV(0.06f, 0.42f), FV(0.95f, 0.95f), 90, 0.002f, 0.006f, Hex(0xD8C8BC, 0.6f), 22);
+				Speckle(P, FV(0.06f, 0.42f), FV(0.95f, 0.95f), 70, 0.002f, 0.005f, Hex(0x3A2C28, 0.6f), 23);
+				Crack(P, { FV(0.2f, 0.55f), FV(0.24f, 0.62f), FV(0.21f, 0.67f) }, 0.004f, Hex(0x3A2A28, 0.8f));
+				Crack(P, { FV(0.55f, 0.84f), FV(0.6f, 0.88f), FV(0.58f, 0.94f) }, 0.004f, Hex(0x3A2A28, 0.8f));
+				Crack(P, { FV(0.86f, 0.82f), FV(0.82f, 0.88f), FV(0.86f, 0.92f) }, 0.004f, Hex(0x3A2A28, 0.8f));
+				for (const FV At : { FV(0.48f, 0.86f), FV(0.12f, 0.84f), FV(0.9f, 0.7f) })
+				{
+					P.MEllipse(At, 0.045f, 0.022f, Hex(0xC86A9A, 0.85f), 0.008f);
+					Speckle(P, At - FV(0.04f, 0.018f), At + FV(0.04f, 0.018f), 8, 0.002f, 0.004f, Hex(0xFFD0E8, 0.9f), (int32)(At.X * 100));
+				}
+				// short moss fronds over the two patches
+				for (const float Cx : { 0.14f, 0.86f })
+				{
+					for (int32 i = 0; i < 9; ++i)
+					{
+						const FV Root(Cx - 0.08f + i * 0.02f, 0.625f - FMath::Abs(i - 4) * 0.004f);
+						const FV Tip = Root + Spin(FV(0.0f, -0.026f - Rand01(51, i) * 0.014f), (Rand01(52, i) - 0.5f) * 50.0f);
+						P.MCapsule(Root, Tip, 0.0035f, Hex(0x58B048, 0.9f));
+						P.MCircle(Tip, 0.004f, Hex(0xB8F090, 0.9f));
+					}
+				}
+			}
 		}
 		// barnacles
 		const FV Barnacles[] = { FV(0.24f, 0.8f), FV(0.32f, 0.86f), FV(0.17f, 0.74f), FV(0.6f, 0.82f), FV(0.68f, 0.86f), FV(0.82f, 0.78f) };
 		for (const FV& B : Barnacles)
 		{
 			P.Ball(B, 0.032f, Hex(0xEAE4D0), 0.2f);
-			P.MCircle(B, 0.012f, Hex(0x3A302C));
+			if (P.bHD)
+			{
+				// the plates of the cone and the beak inside
+				for (int32 k = 0; k < 6; ++k)
+				{
+					const FV Dir = Spin(FV(1.0f, 0.0f), k * 60.0f + 15.0f);
+					P.MCapsule(B + Dir * 0.014f, B + Dir * 0.03f, 0.0018f, Hex(0x8A7E6A, 0.85f));
+				}
+				P.MCircle(B, 0.014f, Hex(0x3A302C));
+				P.MCapsule(B - FV(0.008f, 0.0f), B + FV(0.008f, 0.0f), 0.0025f, Hex(0xD8CCB0));
+			}
+			else
+			{
+				P.MCircle(B, 0.012f, Hex(0x3A302C));
+			}
 		}
 
 		// orange tube sponges
@@ -1387,7 +1905,21 @@ namespace
 			const float X = 0.76f + i * 0.07f;
 			const float Top = 0.14f + i * 0.09f;
 			P.Capsule(FV(X, 0.56f), FV(X, Top), 0.032f, Hex(0xFF9A3E));
+			if (P.bHD)
+			{
+				FClip Clip(P, [X, Top](FV Q) { return SdCapsule(Q, FV(X, 0.56f), FV(X, Top), 0.032f); });
+				Speckle(P, FV(X - 0.03f, Top), FV(X + 0.03f, 0.56f), 22, 0.002f, 0.0045f, Hex(0xA8481A, 0.85f), 30 + i);
+				for (int32 k = 1; k < 5; ++k)
+				{
+					P.MArc(FV(X, Top + k * (0.56f - Top) / 5.0f), 0.034f, 0.003f, 20.0f, 160.0f, Hex(0xC85A20, 0.5f));
+				}
+				P.MCapsule(FV(X - 0.014f, Top + 0.02f), FV(X - 0.014f, 0.5f), 0.005f, Hex(0xFFD8A0, 0.55f));
+			}
 			P.Ellipse(FV(X, Top), 0.032f, 0.016f, Hex(0x6A2A10));
+			if (P.bHD)
+			{
+				P.MEllipse(FV(X, Top + 0.003f), 0.02f, 0.008f, Hex(0x2A0A04));
+			}
 		}
 
 		// the brain coral cap with its meandering grooves
@@ -1411,6 +1943,26 @@ namespace
 				}
 				P.MLine(Groove, 0.0085f, Hex(0x9A2A44, 0.95f));
 			}
+			if (P.bHD)
+			{
+				// lit ridges between the grooves, polyp pores along them, and a darker shaded underside
+				for (int32 Row = 0; Row < 6; ++Row)
+				{
+					const float Y = 0.12f + Row * 0.085f + 0.035f;
+					TArray<FV> Ridge;
+					for (int32 i = 0; i <= 24; ++i)
+					{
+						const float X = 0.07f + i * 0.034f;
+						Ridge.Add(FV(X, Y + FMath::Sin(X * 24.0f + Row * 1.7f + 0.4f) * 0.022f + FMath::Sin(X * 9.0f + Row) * 0.012f));
+					}
+					P.MLine(Ridge, 0.004f, Hex(0xFFC8C4, 0.6f));
+					for (int32 i = 1; i < 24; i += 2)
+					{
+						P.MCircle(Ridge[i] + FV(0.0f, 0.012f), 0.003f, Hex(0x7A1A34, 0.7f));
+					}
+				}
+				P.MEllipse(FV(0.46f, 0.58f), 0.3f, 0.08f, Hex(0x6A1A30, 0.35f), 0.06f);
+			}
 			P.MEllipse(FV(0.32f, 0.19f), 0.15f, 0.07f, Hex(0xFFD8D4, 0.45f), 0.05f);
 		}
 	}
@@ -1433,6 +1985,15 @@ namespace
 			for (int32 i = 0; i < 4; ++i)
 			{
 				P.MLine(Smooth({ FV(0.39f + i * 0.055f, 0.46f), FV(0.4f + i * 0.055f, 0.65f), FV(0.385f + i * 0.055f, 0.87f) }), 0.0055f, Hex(0x4A2E16, 0.75f));
+			}
+			if (P.bHD)
+			{
+				// fine grain, a knot, shipworm holes and green slime at the waterline
+				Strands(P, FV(0.47f, 0.45f), FV(0.47f, 0.88f), 0.1f, 16, 0.0018f, Hex(0x5A3818, 0.7f), 41, 0.012f);
+				P.MEllipse(FV(0.52f, 0.78f), 0.016f, 0.026f, Hex(0x4A2E16, 0.9f), 0.004f);
+				P.Mark([](FV Q) { return FMath::Abs(SdEllipse(Q, FV(0.52f, 0.78f), 0.026f, 0.04f)) - 0.002f; }, Hex(0x4A2E16, 0.6f));
+				Pits(P, FV(0.38f, 0.8f), FV(0.56f, 0.86f), 6, 0.006f, Hex(0x1A0E06, 0.9f), 42);
+				P.MEllipse(FV(0.47f, 0.88f), 0.14f, 0.04f, Hex(0x4E7A2A, 0.7f), 0.03f);
 			}
 		}
 		for (int32 i = 0; i < 4; ++i)
@@ -1461,6 +2022,27 @@ namespace
 			{
 				Rivet(P, FV(0.03f + i * 0.05f, 0.04f), 0.013f);
 			}
+			if (P.bHD)
+			{
+				// brushed iron with scratches, engraved brass bands and a grain on the stock
+				FClip Clip(P, [](FV Q) { return SdBox(Q, FV(-0.13f, -0.075f), FV(0.17f, 0.075f), 0.03f); });
+				Strands(P, FV(-0.13f, 0.0f), FV(0.17f, 0.0f), 0.065f, 12, 0.0012f, Hex(0xE4ECF0, 0.35f), 43, 0.002f);
+				P.MCapsule(FV(-0.08f, 0.02f), FV(0.0f, 0.045f), 0.0015f, Hex(0xFFFFFF, 0.5f));
+				P.MCapsule(FV(0.06f, -0.03f), FV(0.12f, -0.01f), 0.0015f, Hex(0xFFFFFF, 0.45f));
+				P.MEllipse(FV(0.08f, 0.06f), 0.06f, 0.014f, Hex(0x8A4A22, 0.45f), 0.01f);
+			}
+			if (P.bHD)
+			{
+				for (const float X : { -0.04f, 0.155f })
+				{
+					for (int32 k = 0; k < 5; ++k)
+					{
+						P.MCapsule(FV(X - 0.012f, -0.07f + k * 0.035f), FV(X + 0.012f, -0.055f + k * 0.035f), 0.0025f, Hex(0x8A5A14, 0.85f));
+					}
+				}
+				FClip Clip(P, [](FV Q) { return SdBox(Q, FV(-0.32f, -0.05f), FV(-0.1f, 0.06f), 0.03f); });
+				Strands(P, FV(-0.32f, 0.0f), FV(-0.1f, 0.0f), 0.05f, 8, 0.0016f, Hex(0x2E1A0A, 0.7f), 44, 0.008f);
+			}
 		}
 		{
 			// the loaded barbed harpoon
@@ -1487,6 +2069,23 @@ namespace
 		P.MEllipse(FV(0.38f, 0.78f), 0.14f, 0.1f, Hex(0x06090C), 0.02f);
 		P.MLine({ FV(0.12f, 0.8f), FV(0.17f, 0.88f), FV(0.28f, 0.92f) }, 0.006f, Hex(0x2A3238, 0.8f));
 		P.MLine({ FV(0.62f, 0.72f), FV(0.66f, 0.82f), FV(0.62f, 0.9f) }, 0.006f, Hex(0x2A3238, 0.8f));
+		if (P.bHD)
+		{
+			const TArray<FV> RockPts = Smooth({ FV(0.05f, 0.92f), FV(0.05f, 0.7f), FV(0.2f, 0.52f), FV(0.42f, 0.5f), FV(0.62f, 0.6f), FV(0.72f, 0.78f), FV(0.72f, 0.92f), FV(0.4f, 0.96f) }, true, 5);
+			FClip Clip(P, [&RockPts](FV Q) { return FMath::Max(SdPoly(Q, RockPts), -SdEllipse(Q, FV(0.38f, 0.75f), 0.2f, 0.145f)); });
+			Pits(P, FV(0.06f, 0.55f), FV(0.7f, 0.95f), 22, 0.011f, Hex(0x1E2428, 0.85f), 91);
+			Speckle(P, FV(0.05f, 0.5f), FV(0.72f, 0.96f), 80, 0.002f, 0.005f, Hex(0xC8D0D4, 0.55f), 92);
+			Crack(P, { FV(0.5f, 0.56f), FV(0.54f, 0.62f), FV(0.6f, 0.64f) }, 0.004f, Hex(0x2A3238, 0.85f));
+			// sponge and anemone squatters on the rock
+			P.MEllipse(FV(0.2f, 0.58f), 0.05f, 0.022f, Hex(0xE0803C, 0.95f), 0.006f);
+			Speckle(P, FV(0.16f, 0.565f), FV(0.24f, 0.595f), 8, 0.002f, 0.004f, Hex(0x8A3A10, 0.9f), 93);
+			P.MEllipse(FV(0.64f, 0.88f), 0.04f, 0.018f, Hex(0x9A5AC8, 0.9f), 0.006f);
+		}
+		if (P.bHD)
+		{
+			// a rim of light inside the burrow mouth
+			P.MArc(FV(0.38f, 0.76f), 0.165f, 0.006f, 20.0f, 160.0f, Hex(0x6A7A84, 0.6f));
+		}
 
 		const TArray<FV> Path = Smooth({ FV(0.34f, 0.84f), FV(0.42f, 0.66f), FV(0.72f, 0.66f), FV(0.82f, 0.5f), FV(0.68f, 0.38f), FV(0.42f, 0.42f), FV(0.3f, 0.3f), FV(0.42f, 0.2f), FV(0.58f, 0.2f) }, false, 7);
 		{
@@ -1505,6 +2104,28 @@ namespace
 				const FV Nrm(-Tan.Y, Tan.X);
 				P.MCircle(Pos - Nrm * 0.022f, 0.017f, Hex(0x3C3A14, 0.9f));
 				P.MCircle(Pos + Nrm * 0.04f, 0.022f, Hex(0xE8D07A, 0.9f));
+			}
+			if (P.bHD)
+			{
+				// moray mottling, a dotted lateral line and wet light down the back
+				for (int32 i = 0; i < 56; ++i)
+				{
+					FV Pos, Tan;
+					Along(Path, Rand01(94, i), Pos, Tan);
+					const FV Nrm(-Tan.Y, Tan.X);
+					P.MCircle(Pos + Nrm * ((Rand01(95, i) - 0.5f) * 0.12f), 0.004f + Rand01(96, i) * 0.006f, Hex(0x2E2C0E, 0.7f));
+				}
+				for (int32 i = 1; i < 40; ++i)
+				{
+					FV Pos, Tan;
+					Along(Path, i / 40.0f, Pos, Tan);
+					const FV Nrm(-Tan.Y, Tan.X);
+					P.MCircle(Pos + Nrm * 0.008f, 0.003f, Hex(0xF0E8A0, 0.8f));
+					if (i % 2 == 0)
+					{
+						P.MCircle(Pos - Nrm * 0.048f, 0.006f, Hex(0xFFFFE0, 0.35f));
+					}
+				}
 			}
 		}
 		// lightning arcing off the back
@@ -1544,6 +2165,12 @@ namespace
 				FV Pos, Tan;
 				Along(Path, i / 9.0f, Pos, Tan);
 				P.MCircle(Pos + FV(-Tan.Y, Tan.X) * FMath::Lerp(R0, R1, i / 9.0f) * 0.55f, FMath::Lerp(R0, R1, i / 9.0f) * 0.36f, Sucker);
+				if (P.bHD)
+				{
+					// a dark cup in each sucker, and skin papillae along the arm
+					P.MCircle(Pos + FV(-Tan.Y, Tan.X) * FMath::Lerp(R0, R1, i / 9.0f) * 0.55f, FMath::Lerp(R0, R1, i / 9.0f) * 0.16f, Hex(0xB86A4A));
+					P.MCircle(Pos - FV(-Tan.Y, Tan.X) * FMath::Lerp(R0, R1, i / 9.0f) * 0.35f + Tan * 0.008f, FMath::Lerp(R0, R1, i / 9.0f) * 0.14f, Hex(0xFF9A5A, 0.9f));
+				}
 			}
 		};
 
@@ -1571,6 +2198,26 @@ namespace
 		for (const FV Wart : { FV(0.5f, 0.23f), FV(0.42f, 0.29f), FV(0.58f, 0.2f), FV(0.57f, 0.36f) })
 		{
 			P.MCircle(Wart, 0.012f, SkinLight);
+		}
+		if (P.bHD)
+		{
+			const TArray<FV> MantlePts = Smooth({ FV(0.3f, 0.34f), FV(0.33f, 0.14f), FV(0.5f, 0.05f), FV(0.68f, 0.14f), FV(0.71f, 0.36f), FV(0.68f, 0.6f), FV(0.5f, 0.7f), FV(0.33f, 0.6f) }, true, 5);
+			FClip Clip(P, [&MantlePts](FV Q) { return SdPoly(Q, MantlePts); });
+			// mottled chromatophores, papillae with lit tops and fine wrinkles round the eyes
+			Speckle(P, FV(0.3f, 0.05f), FV(0.71f, 0.68f), 90, 0.003f, 0.008f, Hex(0xA8300E, 0.55f), 101);
+			for (int32 i = 0; i < 26; ++i)
+			{
+				const FV At(FMath::Lerp(0.33f, 0.68f, Rand01(102, i)), FMath::Lerp(0.1f, 0.42f, Rand01(103, i)));
+				P.MCircle(At, 0.006f, Hex(0xC2400E, 0.8f));
+				P.MCircle(At + FV(-0.002f, -0.0025f), 0.0028f, Hex(0xFFB080, 0.9f));
+			}
+			for (const float Side : { -1.0f, 1.0f })
+			{
+				for (int32 k = 0; k < 3; ++k)
+				{
+					P.MArc(FV(0.5f + Side * 0.115f, 0.49f), 0.075f + k * 0.012f, 0.0025f, Side > 0 ? 200.0f : 250.0f, Side > 0 ? 290.0f : 340.0f, Hex(0x8E2410, 0.6f));
+				}
+			}
 		}
 		// gold eyes with flat bar pupils
 		for (const float Side : { -1.0f, 1.0f })
@@ -1619,6 +2266,17 @@ namespace
 				const FV Nrm(-Tan.Y, Tan.X);
 				P.MCapsule(Pos - Nrm * 0.14f, Pos + Nrm * 0.14f, 0.008f, Hex(0x173FB0, 0.95f));
 				P.MCircle(Pos - Nrm * 0.03f + Tan * 0.022f, 0.013f, Yellow);
+				if (P.bHD)
+				{
+					// the lit leading edge of each plate, a darker trailing edge and fine stipple
+					P.MCapsule(Pos - Nrm * 0.14f + Tan * 0.012f, Pos + Nrm * 0.14f + Tan * 0.012f, 0.0035f, Hex(0xB8FFE8, 0.55f));
+					P.MCapsule(Pos - Nrm * 0.14f - Tan * 0.012f, Pos + Nrm * 0.14f - Tan * 0.012f, 0.005f, Hex(0x0A5048, 0.45f));
+					P.MCircle(Pos + Nrm * 0.035f + Tan * 0.02f, 0.006f, Hex(0xFF5A3C, 0.9f));
+				}
+			}
+			if (P.bHD)
+			{
+				Speckle(P, FV(0.1f, 0.25f), FV(0.7f, 0.8f), 70, 0.002f, 0.004f, Hex(0x0A4A40, 0.6f), 111);
 			}
 		}
 		// head and carapace
@@ -1635,6 +2293,20 @@ namespace
 			P.Ball(Eye, 0.058f, Hex(0x48E0D0));
 			P.MCapsule(Eye - FV(0.052f, 0.0f), Eye + FV(0.052f, 0.0f), 0.009f, Hex(0x123A70));
 			P.MCircle(Eye + FV(0.018f, -0.002f), 0.016f, Hex(0x06090C));
+			if (P.bHD)
+			{
+				// compound eye facets and the three bands of the midband
+				FClip Clip(P, [Eye](FV Q) { return SdCircle(Q, Eye, 0.058f); });
+				for (int32 Yy = -4; Yy <= 4; ++Yy)
+				{
+					for (int32 Xx = -4; Xx <= 4; ++Xx)
+					{
+						P.Mark([Eye, Xx, Yy](FV Q) { return FMath::Abs(SdCircle(Q, Eye + FV(Xx * 0.014f + (Yy % 2) * 0.007f, Yy * 0.012f), 0.0065f)) - 0.0012f; }, Hex(0x1E8A88, 0.5f));
+					}
+				}
+				P.MCapsule(Eye - FV(0.052f, 0.012f), Eye + FV(0.052f, -0.012f), 0.0025f, Hex(0xE8FFF8, 0.7f));
+				P.MCapsule(Eye - FV(0.052f, -0.012f), Eye + FV(0.052f, 0.012f), 0.0025f, Hex(0xE8FFF8, 0.7f));
+			}
 		}
 		// the club, whipped forward with a flash of bubbles
 		P.Capsule(FV(0.62f, 0.4f), FV(0.72f, 0.52f), 0.03f, Hex(0xE85A8A));
@@ -1643,6 +2315,18 @@ namespace
 		P.Star(FV(0.93f, 0.44f), 0.085f, 0.03f, 6, 10.0f, Hex(0xD8F4FF));
 		P.Ball(FV(0.83f, 0.47f), 0.078f, Red);
 		P.MCircle(FV(0.885f, 0.455f), 0.034f, Yellow);
+		if (P.bHD)
+		{
+			// the club's hard face cracked from impacts, with a shock ring in the water
+			FClip Clip(P, [](FV Q) { return SdCircle(Q, FV(0.83f, 0.47f), 0.078f); });
+			Crack(P, { FV(0.86f, 0.42f), FV(0.84f, 0.46f), FV(0.86f, 0.5f), FV(0.83f, 0.54f) }, 0.0025f, Hex(0x5A0A0A, 0.85f));
+			Crack(P, { FV(0.84f, 0.46f), FV(0.8f, 0.46f) }, 0.002f, Hex(0x5A0A0A, 0.8f));
+		}
+		if (P.bHD)
+		{
+			P.MArc(FV(0.93f, 0.44f), 0.11f, 0.004f, -70.0f, 70.0f, Hex(0xD8F4FF, 0.55f));
+			P.MArc(FV(0.93f, 0.44f), 0.14f, 0.003f, -55.0f, 55.0f, Hex(0xD8F4FF, 0.35f));
+		}
 		for (const FV Spot : { FV(0.8f, 0.43f), FV(0.82f, 0.51f), FV(0.77f, 0.48f) })
 		{
 			P.MCircle(Spot, 0.009f, Hex(0x10080C));
@@ -1676,6 +2360,12 @@ namespace
 		};
 		// sheer web behind the crown, then the crown of tall spines
 		P.Blob({ FV(0.28f, 0.34f), FV(0.3f, 0.13f), FV(0.42f, 0.07f), FV(0.58f, 0.08f), FV(0.66f, 0.3f) }, Hex(0xB84A3C, 0.55f));
+		if (P.bHD)
+		{
+			const TArray<FV> Web = Smooth({ FV(0.28f, 0.34f), FV(0.3f, 0.13f), FV(0.42f, 0.07f), FV(0.58f, 0.08f), FV(0.66f, 0.3f) }, true, 5);
+			FClip Clip(P, [&Web](FV Q) { return SdPoly(Q, Web); });
+			Speckle(P, FV(0.28f, 0.07f), FV(0.66f, 0.34f), 40, 0.003f, 0.008f, Hex(0xFFE8D0, 0.4f), 123);
+		}
 		for (int32 i = 0; i < 7; ++i)
 		{
 			const float X = 0.32f + i * 0.055f;
@@ -1683,6 +2373,13 @@ namespace
 		}
 		// wide striped fan toward the viewer's left
 		P.Blob({ FV(0.48f, 0.52f), FV(0.22f, 0.36f), FV(0.05f, 0.5f), FV(0.1f, 0.74f), FV(0.3f, 0.78f) }, Hex(0xF4E0C4, 0.75f));
+		if (P.bHD)
+		{
+			// translucent fin membrane spotted in maroon
+			const TArray<FV> Fan = Smooth({ FV(0.48f, 0.52f), FV(0.22f, 0.36f), FV(0.05f, 0.5f), FV(0.1f, 0.74f), FV(0.3f, 0.78f) }, true, 5);
+			FClip Clip(P, [&Fan](FV Q) { return SdPoly(Q, Fan); });
+			Speckle(P, FV(0.05f, 0.36f), FV(0.46f, 0.78f), 60, 0.004f, 0.01f, Hex(0x9A2A20, 0.55f), 122);
+		}
 		for (int32 i = 0; i < 7; ++i)
 		{
 			const float Angle = 138.0f + i * 15.0f;
@@ -1707,6 +2404,17 @@ namespace
 			{
 				const float X = 0.22f + i * 0.066f;
 				P.MCapsule(FV(X + 0.03f, 0.26f), FV(X - 0.03f, 0.7f), i % 3 == 0 ? 0.019f : 0.011f, Maroon);
+				if (P.bHD)
+				{
+					// hair-thin pinstripes between the bands and a pale edge on each band
+					P.MCapsule(FV(X + 0.063f, 0.26f), FV(X + 0.003f, 0.7f), 0.0025f, Hex(0xB85A3C, 0.7f));
+					P.MCapsule(FV(X + 0.03f - 0.014f, 0.26f), FV(X - 0.03f - 0.014f, 0.7f), 0.002f, Hex(0xFFF4E0, 0.6f));
+				}
+			}
+			if (P.bHD)
+			{
+				Speckle(P, FV(0.2f, 0.3f), FV(0.8f, 0.66f), 50, 0.002f, 0.005f, Hex(0x6A1410, 0.5f), 121);
+				P.MEllipse(FV(0.52f, 0.63f), 0.26f, 0.05f, Hex(0xFFF8EC, 0.4f), 0.03f);
 			}
 		}
 		// feathery brow, eye and pout
@@ -1729,6 +2437,21 @@ namespace
 		for (int32 i = 0; i < 3; ++i)
 		{
 			P.Poly({ FV(0.13f + i * 0.04f, 0.8f), FV(0.1f + i * 0.05f, 0.56f + i * 0.04f), FV(0.17f + i * 0.04f, 0.8f) }, Hex(0x48B868));
+			if (P.bHD)
+			{
+				P.MLine({ FV(0.15f + i * 0.04f, 0.79f), FV(0.105f + i * 0.05f, 0.58f + i * 0.04f) }, 0.0018f, Hex(0xC8FFB0, 0.6f));
+			}
+		}
+		if (P.bHD)
+		{
+			// ripples and shell grit in the sand
+			FClip Clip(P, [](FV Q) { return SdEllipse(Q, FV(0.42f, 0.8f), 0.3f, 0.07f); });
+			for (int32 k = 0; k < 4; ++k)
+			{
+				P.MArc(FV(0.42f, 0.95f + k * 0.03f), 0.22f + k * 0.03f, 0.0025f, 235.0f, 305.0f, Hex(0xB8A070, 0.6f));
+			}
+			Speckle(P, FV(0.12f, 0.74f), FV(0.72f, 0.87f), 50, 0.002f, 0.005f, Hex(0x9A8458, 0.7f), 133);
+			Speckle(P, FV(0.12f, 0.74f), FV(0.72f, 0.87f), 25, 0.002f, 0.004f, Hex(0xFFFFFF, 0.7f), 134);
 		}
 
 		const FLinearColor Top = Hex(0x7E7C58), Dark = Hex(0x5A583C), Belly = Hex(0xF0E8CC), Ivory = Hex(0xFFF8E0), Bone = Hex(0xB8AE82);
@@ -1756,6 +2479,19 @@ namespace
 			}
 			P.Poly({ FV(-0.04f, -0.05f), FV(0.38f, -0.018f), FV(0.38f, 0.018f), FV(-0.04f, 0.05f) }, Bone);
 			P.MCapsule(FV(0.0f, 0.0f), FV(0.36f, 0.0f), 0.005f, Hex(0x786E48));
+			if (P.bHD)
+			{
+				// sensory pores dotted along the rostrum
+				FClip Clip(P, [](FV Q) { return SdPoly(Q, { FV(-0.04f, -0.05f), FV(0.38f, -0.018f), FV(0.38f, 0.018f), FV(-0.04f, 0.05f) }); });
+				for (int32 i = 0; i < 18; ++i)
+				{
+					const float X = 0.0f + i * 0.02f;
+					const float W = FMath::Lerp(0.03f, 0.012f, X / 0.38f);
+					P.MCircle(FV(X, -W * 0.6f), 0.0022f, Hex(0x5A5032, 0.9f));
+					P.MCircle(FV(X + 0.01f, W * 0.6f), 0.0022f, Hex(0x5A5032, 0.9f));
+				}
+				P.MCapsule(FV(0.0f, -0.012f), FV(0.36f, -0.006f), 0.0025f, Hex(0xFFF8E0, 0.5f));
+			}
 		}
 		// the long flat body, pale beneath
 		const TArray<FV> Body = Smooth({ FV(0.06f, 0.44f), FV(0.2f, 0.38f), FV(0.42f, 0.36f), FV(0.62f, 0.46f), FV(0.66f, 0.55f), FV(0.44f, 0.64f), FV(0.2f, 0.56f) }, true);
@@ -1774,6 +2510,17 @@ namespace
 			for (int32 i = 0; i < 4; ++i)
 			{
 				P.MCapsule(FV(0.44f + i * 0.02f, 0.53f), FV(0.43f + i * 0.02f, 0.58f), 0.004f, Hex(0x302C1C));
+			}
+			if (P.bHD)
+			{
+				// sandpaper skin: dense denticle speckle, a darker saddle, the lateral line and lit gill edges
+				Speckle(P, FV(0.06f, 0.36f), FV(0.66f, 0.6f), 140, 0.0015f, 0.0035f, Hex(0x3E3C28, 0.6f), 131);
+				Speckle(P, FV(0.06f, 0.36f), FV(0.66f, 0.56f), 60, 0.0015f, 0.003f, Hex(0xD8D4B0, 0.5f), 132);
+				P.MLine(Smooth({ FV(0.1f, 0.46f), FV(0.3f, 0.48f), FV(0.5f, 0.5f), FV(0.62f, 0.5f) }), 0.0022f, Hex(0xE8E0C0, 0.55f));
+				for (int32 i = 0; i < 4; ++i)
+				{
+					P.MCapsule(FV(0.446f + i * 0.02f, 0.53f), FV(0.436f + i * 0.02f, 0.58f), 0.0015f, Hex(0xE8E0C0, 0.6f));
+				}
 			}
 		}
 		// broad pectoral fin and a small eye
@@ -1824,6 +2571,24 @@ namespace
 			{
 				P.MCircle(FV(0.6f + i * 0.055f, 0.27f + i * i * 0.004f), 0.012f, SlateLight);
 			}
+			if (P.bHD)
+			{
+				// speckled skin, old pale scars, a lit edge to every tubercle and highlights on the throat grooves
+				Speckle(P, FV(0.2f, 0.24f), FV(0.86f, 0.46f), 90, 0.002f, 0.006f, Hex(0x8496BC, 0.45f), 141);
+				Speckle(P, FV(0.2f, 0.24f), FV(0.86f, 0.46f), 50, 0.002f, 0.004f, Hex(0x1A2238, 0.6f), 142);
+				P.MLine(Smooth({ FV(0.34f, 0.36f), FV(0.38f, 0.34f), FV(0.43f, 0.35f) }), 0.003f, Hex(0xC8D4E8, 0.6f));
+				P.MLine(Smooth({ FV(0.36f, 0.4f), FV(0.41f, 0.385f), FV(0.45f, 0.395f) }), 0.0025f, Hex(0xC8D4E8, 0.5f));
+				for (int32 i = 0; i < 5; ++i)
+				{
+					const FV K(0.6f + i * 0.055f, 0.27f + i * i * 0.004f);
+					P.MCircle(K + FV(-0.004f, -0.005f), 0.005f, Hex(0xB8C8E8, 0.8f));
+				}
+				for (int32 i = 0; i < 6; ++i)
+				{
+					const float Y = 0.45f + i * 0.03f + 0.012f;
+					P.MLine(Smooth({ FV(0.46f + i * 0.01f, Y + 0.03f), FV(0.64f, Y + 0.01f), FV(0.88f, Y - 0.05f) }), 0.002f, Hex(0xFFFFFF, 0.8f));
+				}
+			}
 		}
 		// mouth line, eye and barnacles
 		P.MLine(Smooth({ FV(0.88f, 0.4f), FV(0.72f, 0.4f), FV(0.6f, 0.42f), FV(0.55f, 0.47f) }), 0.006f, Hex(0x0C1420));
@@ -1833,9 +2598,29 @@ namespace
 		{
 			P.Ball(Bump, 0.012f, Hex(0xE8E4D0), 0.1f);
 		}
+		if (P.bHD)
+		{
+			// a whole barnacle colony on the chin
+			for (int32 i = 0; i < 9; ++i)
+			{
+				const FV At(0.7f + Rand01(143, i) * 0.14f, 0.47f + Rand01(144, i) * 0.07f);
+				const float R = 0.006f + Rand01(145, i) * 0.006f;
+				P.Ball(At, R, Hex(0xE0DACA), 0.1f);
+				P.MCircle(At, R * 0.4f, Hex(0x4A4438));
+			}
+		}
 		// long flipper
 		P.Blob({ FV(0.42f, 0.5f), FV(0.32f, 0.62f), FV(0.17f, 0.74f), FV(0.2f, 0.78f), FV(0.38f, 0.7f), FV(0.52f, 0.58f) }, Slate);
 		P.MEllipse(FV(0.29f, 0.7f), 0.08f, 0.018f, Hex(0xE8EEF4, 0.8f));
+		if (P.bHD)
+		{
+			// the knobbly leading edge of the long flipper
+			for (int32 i = 0; i < 6; ++i)
+			{
+				P.Ball(FV(0.4f - i * 0.04f, 0.53f + i * 0.04f), 0.01f, SlateLight, 0.3f);
+			}
+			BubbleTrail(P, FV(0.9f, 0.36f), 4, 0.012f, 146);
+		}
 		// cleaner fish
 		P.Ellipse(FV(0.14f, 0.52f), 0.038f, 0.018f, Hex(0xFFD23C));
 		P.Ellipse(FV(0.86f, 0.68f), 0.038f, 0.018f, Hex(0x2E8AF0));
@@ -1876,6 +2661,23 @@ namespace
 			P.Glow([&Crack](FV Q) { return SdPolyline(Q, Crack, 0.008f); }, Hot, 0.05f, 0.8f);
 			P.MLine(Crack, 0.01f, Hot);
 			P.MLine(Crack, 0.004f, Hex(0xFFE0A0));
+			if (P.bHD)
+			{
+				// glassy black chimney rock: blistered crust, sulfur crystals, hairline glow cracks and drips
+				Pits(P, FV(0.3f, 0.4f), FV(0.72f, 0.88f), 26, 0.01f, Hex(0x0E0A0C, 0.9f), 151);
+				Speckle(P, FV(0.3f, 0.38f), FV(0.74f, 0.88f), 90, 0.002f, 0.005f, Hex(0xFFE870, 0.75f), 152);
+				Speckle(P, FV(0.3f, 0.38f), FV(0.74f, 0.88f), 60, 0.002f, 0.004f, Hex(0x8A8088, 0.6f), 153);
+				for (const TArray<FV>& Hair : { TArray<FV>{ FV(0.5f, 0.5f), FV(0.44f, 0.54f), FV(0.4f, 0.52f) }, TArray<FV>{ FV(0.5f, 0.72f), FV(0.6f, 0.76f), FV(0.66f, 0.74f) }, TArray<FV>{ FV(0.56f, 0.6f), FV(0.62f, 0.56f) } })
+				{
+					P.Glow([&Hair](FV Q) { return SdPolyline(Q, Hair, 0.003f); }, Hot, 0.02f, 0.6f);
+					P.MLine(Hair, 0.0028f, Hex(0xFFB060));
+				}
+				for (const float X : { 0.42f, 0.6f, 0.66f })
+				{
+					P.MCapsule(FV(X, 0.47f), FV(X, 0.52f + X * 0.05f), 0.006f, Hex(0xF2D438, 0.85f));
+					P.MCircle(FV(X, 0.53f + X * 0.05f), 0.008f, Hex(0xF2D438, 0.9f));
+				}
+			}
 		}
 		// glowing mouth
 		P.Ellipse(FV(0.55f, 0.36f), 0.1f, 0.03f, Sulfur);
@@ -1885,7 +2687,25 @@ namespace
 		{
 			const FV Base(0.14f + i * 0.075f, 0.88f), Tip(0.15f + i * 0.07f, 0.62f - (i % 2) * 0.08f);
 			P.Capsule(Base, Tip, 0.018f, Hex(0xF4F0E0));
+			if (P.bHD)
+			{
+				// growth rings on the chitin tube and feathery plume filaments
+				for (int32 k = 1; k < 9; ++k)
+				{
+					const FV At = FMath::Lerp(Base, Tip, k / 9.0f);
+					P.MArc(At, 0.019f, 0.0025f, 20.0f, 160.0f, Hex(0xA89C80, 0.7f));
+				}
+			}
 			P.Star(Tip + FV(0.0f, -0.03f), 0.055f, 0.022f, 7, 12.0f * i, Hex(0xE8282C));
+			if (P.bHD)
+			{
+				for (int32 k = 0; k < 7; ++k)
+				{
+					const FV Dir = Spin(FV(1.0f, 0.0f), 12.0f * i + k * (360.0f / 7.0f));
+					P.MLine({ Tip + FV(0.0f, -0.03f) + Dir * 0.012f, Tip + FV(0.0f, -0.03f) + Dir * 0.048f }, 0.0018f, Hex(0xFFB0A8, 0.85f));
+				}
+				P.MCircle(Tip + FV(0.0f, -0.03f), 0.012f, Hex(0x8A0A10));
+			}
 		}
 		// a shell plate eaten full of holes
 		P.Ellipse(FV(0.86f, 0.36f), 0.07f, 0.06f, Hex(0xD87A3C));
@@ -1894,8 +2714,15 @@ namespace
 		P.MCircle(FV(0.84f, 0.395f), 0.01f, Hex(0x9CE838));
 	}
 
+#include "TDIconsHD.inl"
+#include "TDIconsHDTowers.inl"
+
 	void PaintTower(FPainter& P, ETDTowerType Type)
 	{
+		if (P.bHD && PaintTowerHD(P, Type))
+		{
+			return;
+		}
 		switch (Type)
 		{
 		case ETDTowerType::Wall:
@@ -1934,6 +2761,20 @@ namespace
 					Rivet(P, FV(0.27f + i * 0.092f, Y), 0.013f);
 				}
 			}
+			if (P.bHD)
+			{
+				// hammered panels, a seam, dents, rust blooms and a waterline of algae
+				Strands(P, FV(0.5f, 0.55f), FV(0.5f, 0.9f), 0.3f, 22, 0.001f, Hex(0xC8D4DA, 0.14f), 81, 0.004f);
+				P.MCapsule(FV(0.5f, 0.6f), FV(0.5f, 0.9f), 0.003f, Hex(0x1E282E, 0.8f));
+				P.MCapsule(FV(0.505f, 0.6f), FV(0.505f, 0.9f), 0.0015f, Hex(0xC8D4DA, 0.5f));
+				Pits(P, FV(0.26f, 0.62f), FV(0.74f, 0.88f), 10, 0.01f, Hex(0x2A343A, 0.6f), 82);
+				for (const FV At : { FV(0.3f, 0.82f), FV(0.66f, 0.66f), FV(0.58f, 0.86f) })
+				{
+					P.MEllipse(At, 0.04f, 0.022f, Hex(0x8A4A22, 0.55f), 0.02f);
+					Speckle(P, At - FV(0.035f, 0.018f), At + FV(0.035f, 0.018f), 10, 0.002f, 0.005f, Hex(0xC8702E, 0.8f), (int32)(At.Y * 300));
+				}
+				P.MEllipse(FV(0.5f, 0.9f), 0.3f, 0.035f, Hex(0x3E7A3A, 0.7f), 0.02f);
+			}
 			break;
 		}
 		case ETDTowerType::Eel:
@@ -1971,11 +2812,26 @@ namespace
 		P.MPoly({ X(-0.02f, -0.03f), X(-0.015f, -0.15f), X(0.1f, -0.1f) }, Hex(0x5A1E0A));
 		P.MCircle(X(-0.08f, -0.14f), 0.018f * S / 0.5f, Alpha(Tip, 0.9f));
 		P.MCircle(X(0.1f, -0.06f), 0.015f * S / 0.5f, Alpha(Tip, 0.9f));
+		if (P.bHD)
+		{
+			// knobbly teeth along the pincer edges and a grainy shell
+			for (int32 k = 0; k < 4; ++k)
+			{
+				P.MCircle(X(-0.035f, -0.06f - k * 0.03f), 0.006f * S / 0.5f, Hex(0xFFF0E0, 0.9f));
+				P.MCircle(X(0.03f + k * 0.03f, -0.05f - k * 0.015f), 0.005f * S / 0.5f, Hex(0xFFF0E0, 0.9f));
+			}
+			Speckle(P, X(-0.15f, -0.18f), X(0.15f, 0.13f), 26, 0.002f, 0.004f, Alpha(Tone(Color, 0.6f), 0.6f), (int32)(Dir * 7 + 170));
+		}
 		P.Gloss(X(-0.08f, 0.0f), 0.03f * S, 0.05f * S, 0.5f);
 	}
 
+
 	void PaintEnemy(FPainter& P, ETDEnemyType Type)
 	{
+		if (P.bHD && PaintEnemyHD(P, Type))
+		{
+			return;
+		}
 		switch (Type)
 		{
 		case ETDEnemyType::Crab:
@@ -1991,6 +2847,16 @@ namespace
 					const TArray<FV> Seg = { FV(0.5f + F * 0.17f, Y), FV(0.5f + F * (0.34f - i * 0.02f), Y - 0.03f), FV(0.5f + F * (0.41f - i * 0.03f), Y + 0.13f) };
 					P.Line(Seg, 0.021f, Leg);
 					P.MCircle(Seg[1], 0.012f, Hex(0xF8A070));
+					if (P.bHD)
+					{
+						// bristles and dark tips on each walking leg
+						P.MCapsule(Seg[2] - (Seg[2] - Seg[1]) * 0.25f, Seg[2], 0.012f, Hex(0x5A1E0A, 0.85f));
+						for (int32 k = 1; k < 4; ++k)
+						{
+							const FV At = FMath::Lerp(Seg[0], Seg[1], k / 4.0f);
+							P.MCapsule(At, At + FV(0.0f, -0.018f), 0.002f, Hex(0x7A2A0A, 0.8f));
+						}
+					}
 				}
 			}
 			// arms and claws
@@ -2019,6 +2885,26 @@ namespace
 				{
 					P.MCircle(Dot, 0.016f, Hex(0xA83C10, 0.9f));
 				}
+				if (P.bHD)
+				{
+					// grainy shell, the grooves that split the carapace into regions, and tiny tubercles with lit tops
+					Speckle(P, FV(0.2f, 0.39f), FV(0.8f, 0.78f), 110, 0.002f, 0.005f, Hex(0xB8401A, 0.55f), 161);
+					P.MLine(Smooth({ FV(0.36f, 0.42f), FV(0.42f, 0.5f), FV(0.5f, 0.52f), FV(0.58f, 0.5f), FV(0.64f, 0.42f) }), 0.003f, Hex(0x9A3410, 0.7f));
+					P.MLine(Smooth({ FV(0.3f, 0.48f), FV(0.36f, 0.56f), FV(0.34f, 0.66f) }), 0.003f, Hex(0x9A3410, 0.6f));
+					P.MLine(Smooth({ FV(0.7f, 0.48f), FV(0.64f, 0.56f), FV(0.66f, 0.66f) }), 0.003f, Hex(0x9A3410, 0.6f));
+					for (int32 i = 0; i < 22; ++i)
+					{
+						const FV At(FMath::Lerp(0.26f, 0.74f, Rand01(162, i)), FMath::Lerp(0.42f, 0.66f, Rand01(163, i)));
+						P.MCircle(At, 0.005f, Hex(0xD85420, 0.9f));
+						P.MCircle(At + FV(-0.0015f, -0.002f), 0.0022f, Hex(0xFFC8A0, 0.9f));
+					}
+					// serrated front edge
+					for (int32 i = 0; i < 9; ++i)
+					{
+						const FV At(0.33f + i * 0.042f, 0.41f + FMath::Abs(i - 4) * 0.006f);
+						P.MPoly({ At + FV(-0.012f, 0.004f), At + FV(0.0f, -0.008f), At + FV(0.012f, 0.004f) }, Hex(0xFF9A60, 0.8f));
+					}
+				}
 				// smile
 				P.MArc(FV(0.5f, 0.59f), 0.075f, 0.014f, 25.0f, 155.0f, Hex(0x5A1E0A));
 			}
@@ -2041,6 +2927,19 @@ namespace
 			}
 			P.Blob({ FV(0.34f, 0.3f), FV(0.42f, 0.14f), FV(0.56f, 0.18f), FV(0.66f, 0.3f) }, Fin);
 			P.Blob({ FV(0.44f, 0.74f), FV(0.46f, 0.88f), FV(0.58f, 0.84f), FV(0.62f, 0.72f) }, Fin);
+			if (P.bHD)
+			{
+				// fin rays and ragged, bitten edges
+				for (int32 i = 0; i < 6; ++i)
+				{
+					P.MCapsule(FV(0.4f + i * 0.04f, 0.3f), FV(0.42f + i * 0.03f, 0.18f + FMath::Abs(i - 2.5f) * 0.012f), 0.0025f, Hex(0x3A1012, 0.7f));
+					P.MCapsule(FV(0.48f + i * 0.022f, 0.74f), FV(0.48f + i * 0.02f, 0.84f), 0.0022f, Hex(0x3A1012, 0.7f));
+				}
+				for (int32 i = 0; i < 7; ++i)
+				{
+					P.MCapsule(FV(0.26f, 0.5f), FV(0.08f, 0.32f + i * 0.06f), 0.0022f, Hex(0x3A1012, 0.6f));
+				}
+			}
 
 			const TArray<FV> Outline = Smooth({ FV(0.2f, 0.5f), FV(0.34f, 0.32f), FV(0.56f, 0.24f), FV(0.76f, 0.3f), FV(0.92f, 0.46f), FV(0.9f, 0.62f), FV(0.72f, 0.74f), FV(0.5f, 0.77f), FV(0.32f, 0.68f) }, true, 5);
 			const auto Body = [&Outline](FV Q) { return SdPoly(Q, Outline); };
@@ -2062,6 +2961,13 @@ namespace
 						const FV C(0.28f + Col * 0.06f + (Row % 2) * 0.03f, 0.38f + Row * 0.065f);
 						P.MArc(C, 0.03f, 0.007f, 270.0f, 450.0f, Hex(0x5E6C76, 0.75f));
 					}
+				}
+				if (P.bHD)
+				{
+					// fine silver scales over the whole flank with glittering flecks
+					Scales(P, FV(0.22f, 0.3f), FV(0.66f, 0.74f), 0.034f, 0.0f, Hex(0x6E7C86, 0.45f), Hex(0xFFFFFF, 0.35f));
+					Speckle(P, FV(0.22f, 0.3f), FV(0.7f, 0.74f), 50, 0.002f, 0.004f, Hex(0xFFFFFF, 0.8f), 181);
+					Speckle(P, FV(0.3f, 0.26f), FV(0.7f, 0.42f), 30, 0.003f, 0.006f, Hex(0x2E3A44, 0.6f), 182);
 				}
 				P.MArc(FV(0.54f, 0.5f), 0.18f, 0.012f, -60.0f, 60.0f, Hex(0x3A4852, 0.8f));
 				P.MEllipse(FV(0.5f, 0.36f), 0.14f, 0.03f, Hex(0xFFFFFF, 0.55f), 0.02f);
@@ -2089,6 +2995,15 @@ namespace
 			P.MCircle(FV(0.745f, 0.415f), 0.03f, Ink);
 			P.MCircle(FV(0.735f, 0.405f), 0.009f, White);
 			P.MPoly({ FV(0.65f, 0.34f), FV(0.82f, 0.385f), FV(0.8f, 0.4f), FV(0.65f, 0.37f) }, Hex(0x2A343C));
+			if (P.bHD)
+			{
+				// a gold iris ring, gill cover line and nostril
+				P.Mark([](FV Q) { return FMath::Abs(SdCircle(Q, FV(0.745f, 0.415f), 0.042f)) - 0.003f; }, Hex(0xC88A10, 0.8f));
+				P.MArc(FV(0.6f, 0.52f), 0.12f, 0.004f, -70.0f, 50.0f, Hex(0xE8EEF2, 0.6f));
+				P.MCircle(FV(0.86f, 0.46f), 0.006f, Hex(0x1A2228));
+				// blood-tinged gums
+				P.MCapsule(FV(0.75f, 0.57f), FV(0.92f, 0.52f), 0.005f, Hex(0xC83040, 0.8f));
+			}
 			break;
 		}
 		case ETDEnemyType::Turtle:
@@ -2106,6 +3021,19 @@ namespace
 				P.Ribbon(Smooth({ Root, Mid, TipPos }), 0.07f, 0.03f, Skin);
 				P.MCircle(Mid, 0.02f, Alpha(SkinDark, 0.9f));
 				P.MCircle(Mid + (TipPos - Mid) * 0.55f, 0.012f, Alpha(SkinDark, 0.9f));
+				if (P.bHD)
+				{
+					// polygonal scale plates on the flipper and a claw near its edge
+					const TArray<FV> Fl = Smooth({ Root, Mid, TipPos });
+					FClip Clip(P, [&Fl](FV Q) { return SdRibbon(Q, Fl, 0.07f, 0.03f); });
+					for (int32 k = 0; k < 14; ++k)
+					{
+						FV Pos, Tan;
+						Along(Fl, Rand01(190 + i, k), Pos, Tan);
+						const FV At = Pos + FV(-Tan.Y, Tan.X) * ((Rand01(194 + i, k) - 0.5f) * 0.08f);
+						P.Mark([At](FV Q) { return FMath::Abs(SdCircle(Q, At, 0.011f)) - 0.0018f; }, Alpha(SkinDark, 0.7f));
+					}
+				}
 			}
 			P.Poly({ FV(0.18f, 0.46f), FV(0.05f, 0.5f), FV(0.18f, 0.54f) }, Skin);
 
@@ -2118,6 +3046,16 @@ namespace
 			P.MCircle(FV(0.893f, 0.44f), 0.014f, Ink);
 			P.MCircle(FV(0.893f, 0.56f), 0.014f, Ink);
 			P.MCapsule(FV(0.93f, 0.47f), FV(0.93f, 0.53f), 0.006f, Hex(0x2A4A20));
+			if (P.bHD)
+			{
+				// head scales and a hooked beak
+				FClip Clip(P, [](FV Q) { return SdCircle(Q, FV(0.84f, 0.5f), 0.1f); });
+				for (const FV At : { FV(0.78f, 0.5f), FV(0.82f, 0.48f), FV(0.82f, 0.52f), FV(0.86f, 0.5f), FV(0.76f, 0.45f), FV(0.76f, 0.55f) })
+				{
+					P.Mark([At](FV Q) { return FMath::Abs(SdCircle(Q, At, 0.016f)) - 0.002f; }, Alpha(SkinDark, 0.7f));
+				}
+				P.MArc(FV(0.9f, 0.5f), 0.035f, 0.006f, -50.0f, 50.0f, Hex(0x2A4A20, 0.9f));
+			}
 
 			// domed shell, rim plates, then the big scutes
 			const auto Shell = [](FV Q) { return SdEllipse(Q, FV(0.45f, 0.5f), 0.34f, 0.29f); };
@@ -2151,6 +3089,29 @@ namespace
 					Inner.Add(C + (Pt - C) * 0.55f);
 				}
 				P.Mark([&Inner](FV Q) { return FMath::Abs(SdPoly(Q, Inner)) - 0.004f; }, Alpha(Seam, 0.7f));
+				if (P.bHD)
+				{
+					// more growth rings, radiating streaks and a sunlit upper edge on each scute
+					TArray<FV> Ring2, Ring3;
+					for (const FV& Pt : Pts)
+					{
+						Ring2.Add(C + (Pt - C) * 0.78f);
+						Ring3.Add(C + (Pt - C) * 0.3f);
+					}
+					P.Mark([&Ring2](FV Q) { return FMath::Abs(SdPoly(Q, Ring2)) - 0.0025f; }, Alpha(Seam, 0.45f));
+					P.Mark([&Ring3](FV Q) { return FMath::Abs(SdPoly(Q, Ring3)) - 0.0025f; }, Alpha(Seam, 0.45f));
+					for (int32 k = 0; k < 6; ++k)
+					{
+						P.MCapsule(C + (Pts[k] - C) * 0.3f, C + (Pts[k] - C) * 0.92f, 0.002f, Alpha(Seam, 0.4f));
+					}
+					for (int32 k = 0; k < 10; ++k)
+					{
+						const FV At = C + FV((Rand01((int32)(C.X * 1000), k) - 0.5f) * Rx * 1.2f, (Rand01((int32)(C.Y * 1000), k) - 0.5f) * Ry * 1.2f);
+						P.MCircle(At, 0.004f, Hex(0x3E6A2A, 0.7f));
+						P.MCircle(At + FV(-0.004f, 0.0f), 0.003f, Hex(0xD8F0A0, 0.5f));
+					}
+					P.MLine({ Pts[3] + (C - Pts[3]) * 0.12f, Pts[4] + (C - Pts[4]) * 0.12f, Pts[5] + (C - Pts[5]) * 0.12f }, 0.003f, Hex(0xE8FFC0, 0.5f));
+				}
 			};
 			for (int32 i = 0; i < 3; ++i)
 			{
@@ -2170,6 +3131,10 @@ namespace
 			const FLinearColor Back = Hex(0x2C3548);
 			// tail
 			P.Ribbon(Smooth({ FV(0.5f, 0.68f), FV(0.52f, 0.82f), FV(0.47f, 0.97f) }), 0.018f, 0.006f, Hex(0x1C2432));
+			if (P.bHD)
+			{
+				P.MLine(Smooth({ FV(0.497f, 0.7f), FV(0.515f, 0.82f), FV(0.47f, 0.95f) }), 0.003f, Hex(0x6A7A98, 0.7f));
+			}
 
 			// pale underside peeks past the wing edge
 			const TArray<FV> Wings = Smooth({ FV(0.5f, 0.2f), FV(0.66f, 0.26f), FV(0.84f, 0.4f), FV(0.98f, 0.58f), FV(0.76f, 0.58f), FV(0.6f, 0.64f), FV(0.5f, 0.76f), FV(0.4f, 0.64f), FV(0.24f, 0.58f), FV(0.02f, 0.58f), FV(0.16f, 0.4f), FV(0.34f, 0.26f) }, true, 4);
@@ -2205,6 +3170,21 @@ namespace
 						P.MCapsule(FV(0.5f + F * 0.05f, 0.45f + i * 0.03f), FV(0.5f + F * 0.1f, 0.44f + i * 0.03f), 0.005f, Hex(0x0C121C, 0.9f));
 					}
 				}
+				if (P.bHD)
+				{
+					// starry dorsal speckle, a sheen across each wing and lit ridges along the rib lines
+					Speckle(P, FV(0.05f, 0.24f), FV(0.95f, 0.7f), 120, 0.0015f, 0.0045f, Hex(0xB8C8E8, 0.55f), 201);
+					Speckle(P, FV(0.05f, 0.24f), FV(0.95f, 0.7f), 60, 0.003f, 0.008f, Hex(0x141A28, 0.6f), 202);
+					for (int32 Side = -1; Side <= 1; Side += 2)
+					{
+						const float F = (float)Side;
+						for (int32 i = 0; i < 4; ++i)
+						{
+							P.MCapsule(FV(0.5f + F * 0.13f, 0.334f + i * 0.055f), FV(0.5f + F * (0.34f + i * 0.02f), 0.414f + i * 0.055f), 0.0022f, Hex(0xC8D8F8, 0.45f));
+						}
+						P.MLine(Smooth({ FV(0.5f + F * 0.18f, 0.3f), FV(0.5f + F * 0.32f, 0.36f), FV(0.5f + F * 0.44f, 0.5f) }), 0.006f, Hex(0xFFFFFF, 0.18f));
+					}
+				}
 				P.MCapsule(FV(0.5f, 0.34f), FV(0.5f, 0.68f), 0.008f, Hex(0x8496BC, 0.8f));
 				P.MEllipse(FV(0.3f, 0.36f), 0.1f, 0.018f, Hex(0xFFFFFF, 0.2f), 0.02f);
 				P.MEllipse(FV(0.7f, 0.36f), 0.1f, 0.018f, Hex(0xFFFFFF, 0.2f), 0.02f);
@@ -2213,6 +3193,19 @@ namespace
 			P.Ball(FV(0.58f, 0.29f), 0.03f, Hex(0xF0E6C8), 0.1f);
 			P.MCircle(FV(0.42f, 0.295f), 0.015f, Ink);
 			P.MCircle(FV(0.58f, 0.295f), 0.015f, Ink);
+			if (P.bHD)
+			{
+				P.MCircle(FV(0.415f, 0.288f), 0.005f, White);
+				P.MCircle(FV(0.575f, 0.288f), 0.005f, White);
+				// horn folds
+				for (const float F : { -1.0f, 1.0f })
+				{
+					for (int32 k = 0; k < 3; ++k)
+					{
+						P.MCapsule(FV(0.5f + F * (0.085f + k * 0.008f), 0.21f - k * 0.04f), FV(0.5f + F * (0.11f + k * 0.008f), 0.205f - k * 0.04f), 0.0025f, Hex(0x1C2432, 0.8f));
+					}
+				}
+			}
 			break;
 		}
 		case ETDEnemyType::Kraken:
@@ -2244,6 +3237,22 @@ namespace
 					const FV Side = FV(-Tan.Y, Tan.X) * ((a % 2) ? -1.0f : 1.0f);
 					P.MCircle(Pos + Side * Radius * 0.65f, Radius, Sucker);
 					P.MCircle(Pos + Side * Radius * 0.65f, Radius * 0.42f, ArmDark);
+					if (P.bHD)
+					{
+						P.MArc(Pos + Side * Radius * 0.65f, Radius * 0.75f, Radius * 0.2f, 200.0f, 300.0f, Hex(0xFFFFFF, 0.6f));
+					}
+				}
+				if (P.bHD)
+				{
+					// skin texture and a lit ridge along the top of each arm
+					FClip Clip(P, [&Path](FV Q) { return SdRibbon(Q, Path, 0.066f, 0.016f); });
+					for (int32 i = 0; i < 18; ++i)
+					{
+						FV Pos, Tan;
+						Along(Path, Rand01(210 + a, i), Pos, Tan);
+						P.MCircle(Pos - FV(-Tan.Y, Tan.X) * ((a % 2) ? -1.0f : 1.0f) * 0.02f * (1.0f - Rand01(220 + a, i) * 0.5f), 0.004f, Hex(0x4A1A6A, 0.6f));
+					}
+					P.MLine(Path, 0.003f, Hex(0xD8A0F0, 0.35f));
 				}
 			}
 
@@ -2270,6 +3279,25 @@ namespace
 					P.MCircle(Wart, 0.017f, Hex(0x6A2A98, 0.9f));
 					P.MCircle(Wart + FV(-0.004f, -0.005f), 0.0065f, Hex(0xE8B8F4, 0.9f));
 				}
+				if (P.bHD)
+				{
+					// veined, pebbled mantle with barnacle-crusted scars of old battles
+					Speckle(P, FV(0.23f, 0.03f), FV(0.77f, 0.68f), 120, 0.002f, 0.006f, Hex(0x5A1E88, 0.5f), 231);
+					Speckle(P, FV(0.23f, 0.03f), FV(0.77f, 0.5f), 50, 0.002f, 0.004f, Hex(0xF0C8FF, 0.5f), 232);
+					for (int32 i = 0; i < 5; ++i)
+					{
+						const float X = 0.3f + i * 0.1f;
+						P.MLine(Smooth({ FV(X, 0.1f + FMath::Abs(X - 0.5f) * 0.3f), FV(X + 0.02f, 0.2f), FV(X - 0.01f, 0.28f), FV(X + 0.015f, 0.34f) }), 0.0025f, Hex(0x5A1E88, 0.5f));
+					}
+					P.MLine(Smooth({ FV(0.58f, 0.08f), FV(0.64f, 0.16f), FV(0.66f, 0.26f) }), 0.006f, Hex(0x5A1E88, 0.9f));
+					P.MLine(Smooth({ FV(0.585f, 0.085f), FV(0.645f, 0.165f), FV(0.665f, 0.265f) }), 0.002f, Hex(0xF0C8FF, 0.6f));
+					for (int32 i = 0; i < 6; ++i)
+					{
+						const FV At(0.3f + Rand01(233, i) * 0.08f, 0.2f + Rand01(234, i) * 0.08f);
+						P.MCircle(At, 0.008f, Hex(0xE8E0D0, 0.9f));
+						P.MCircle(At, 0.003f, Hex(0x3A2A2A, 0.9f));
+					}
+				}
 				P.Gloss(FV(0.39f, 0.13f), 0.085f, 0.035f, 0.55f);
 			}
 
@@ -2280,11 +3308,27 @@ namespace
 				const FV Eye(0.5f + F * 0.115f, 0.41f);
 				P.Glow([Eye](FV Q) { return SdCircle(Q, Eye, 0.07f); }, Hex(0xC89A10), 0.05f, 0.6f);
 				P.Ball(Eye, 0.078f, Hex(0xFFD54A), 0.4f);
+				if (P.bHD)
+				{
+					// streaked iris and a dark limbal ring
+					FClip Clip(P, [Eye](FV Q) { return SdCircle(Q, Eye, 0.078f); });
+					for (int32 k = 0; k < 20; ++k)
+					{
+						const FV Dir = Spin(FV(1.0f, 0.0f), k * 18.0f);
+						P.MCapsule(Eye + Dir * 0.025f, Eye + Dir * 0.07f, 0.002f, Hex(0xC07A10, 0.55f));
+					}
+					P.Mark([Eye](FV Q) { return FMath::Abs(SdCircle(Q, Eye, 0.072f)) - 0.006f; }, Hex(0x7A4A08, 0.75f));
+				}
 				P.MEllipse(Eye, 0.018f, 0.062f, Ink);
 				P.MCircle(Eye + FV(-0.02f, -0.025f), 0.012f, Hex(0xFFFFFF, 0.9f));
 				P.MPoly({ Eye + FV(F * -0.1f, -0.045f), Eye + FV(F * 0.09f, -0.095f), Eye + FV(F * 0.095f, -0.065f), Eye + FV(F * -0.09f, -0.015f) }, Hex(0x4A1C6E));
 			}
 			P.Poly({ FV(0.46f, 0.53f), FV(0.54f, 0.53f), FV(0.5f, 0.6f) }, Hex(0xE8B040));
+			if (P.bHD)
+			{
+				P.MLine({ FV(0.5f, 0.535f), FV(0.5f, 0.59f) }, 0.002f, Hex(0x8A5A10, 0.9f));
+				P.MLine({ FV(0.47f, 0.54f), FV(0.49f, 0.545f) }, 0.002f, Hex(0xFFF0B0, 0.8f));
+			}
 			break;
 		}
 		case ETDEnemyType::SeaStar:
@@ -2315,11 +3359,38 @@ namespace
 					P.Ball(Mid + Dir * (R + 0.03f) + Perp * W, Size * 0.72f, Hex(0xFFC890), 0.2f);
 					P.Ball(Mid + Dir * (R + 0.03f) - Perp * W, Size * 0.72f, Hex(0xFFC890), 0.2f);
 				}
+				if (P.bHD)
+				{
+					// tube-foot grooves showing at the edges and a mesh of tiny spines
+					for (int32 k = 0; k < 16; ++k)
+					{
+						const float R = 0.1f + k * 0.022f;
+						const float W = FMath::Lerp(0.1f, 0.03f, k / 16.0f);
+						for (const float S : { -1.0f, 1.0f })
+						{
+							P.MCircle(Mid + Dir * R + Perp * W * S * (0.6f + 0.35f * Rand01(240 + i, k)), 0.0035f, Hex(0xFFE8C8, 0.85f));
+							P.MCircle(Mid + Dir * (R + 0.01f) + Perp * W * S * 0.35f, 0.0028f, Hex(0xA8441A, 0.7f));
+						}
+					}
+				}
+			}
+			if (P.bHD)
+			{
+				Speckle(P, FV(0.05f, 0.08f), FV(0.95f, 0.98f), 140, 0.002f, 0.005f, Hex(0xC04A18, 0.6f), 245);
 			}
 			P.Ball(Mid, 0.05f, Hex(0xD9673A), 0.3f);
 			for (int32 i = 0; i < 5; ++i)
 			{
 				P.MCircle(Mid + Spin(FV(0.075f, 0.0f), -54.0f + i * 72.0f), 0.012f, Hex(0xB24A1E));
+			}
+			if (P.bHD)
+			{
+				// the madreporite: a little sieve plate off centre
+				P.Ball(Mid + FV(0.035f, 0.055f), 0.016f, Hex(0xFFD040), 0.3f);
+				for (int32 k = 0; k < 4; ++k)
+				{
+					P.MCapsule(Mid + FV(0.025f, 0.047f + k * 0.006f), Mid + FV(0.045f, 0.047f + k * 0.006f), 0.0012f, Hex(0x9A6A10, 0.9f));
+				}
 			}
 			break;
 		}
@@ -2329,7 +3400,17 @@ namespace
 			for (int32 i = 0; i < 5; ++i)
 			{
 				const float Y = 0.42f + i * 0.04f;
-				P.Ribbon(Smooth({ FV(0.68f, 0.5f), FV(0.82f, Y + (Y - 0.5f) * 0.4f), FV(0.91f, Y + (Y - 0.5f) * 1.1f + 0.015f * ((i % 2) ? 1.0f : -1.0f)), FV(0.97f, Y + (Y - 0.5f) * 1.6f) }), 0.024f, 0.007f, i % 2 ? Hex(0xB5865A) : Hex(0xC89A6E));
+				const TArray<FV> ArmPath = Smooth({ FV(0.68f, 0.5f), FV(0.82f, Y + (Y - 0.5f) * 0.4f), FV(0.91f, Y + (Y - 0.5f) * 1.1f + 0.015f * ((i % 2) ? 1.0f : -1.0f)), FV(0.97f, Y + (Y - 0.5f) * 1.6f) });
+				P.Ribbon(ArmPath, 0.024f, 0.007f, i % 2 ? Hex(0xB5865A) : Hex(0xC89A6E));
+				if (P.bHD)
+				{
+					for (int32 k = 1; k < 8; ++k)
+					{
+						FV Pos, Tan;
+						Along(ArmPath, k / 8.0f, Pos, Tan);
+						P.MCircle(Pos + FV(-Tan.Y, Tan.X) * 0.006f, FMath::Lerp(0.006f, 0.0025f, k / 8.0f), Hex(0xFFE8D0, 0.85f));
+					}
+				}
 			}
 
 			// the rippling fin that skirts the mantle
@@ -2342,6 +3423,17 @@ namespace
 				FWith With(P);
 				P.Look.Dome = 0.05f;
 				P.Fill(Fin, Hex(0xF2E0BE));
+			}
+			if (P.bHD)
+			{
+				// fin rays and a lacy blue edge
+				FClip Clip(P, Fin);
+				for (int32 k = 0; k < 48; ++k)
+				{
+					const FV Dir = Spin(FV(1.0f, 0.0f), k * 7.5f);
+					P.MCapsule(FV(0.42f, 0.5f) + FV(Dir.X * 0.32f, Dir.Y * 0.2f), FV(0.42f, 0.5f) + FV(Dir.X * 0.39f, Dir.Y * 0.29f), 0.0018f, Hex(0xB8A07A, 0.6f));
+				}
+				P.Mark([](FV Q) { return FMath::Abs(SdEllipse(Q, FV(0.42f, 0.5f), 0.37f, 0.27f)) - 0.003f; }, Hex(0x6AC8E8, 0.6f));
 			}
 			const auto Mantle = [](FV Q) { return SdEllipse(Q, FV(0.43f, 0.5f), 0.32f, 0.2f); };
 			{
@@ -2359,12 +3451,29 @@ namespace
 					P.MLine(Smooth({ FV(X + 0.012f, 0.3f), FV(X - 0.012f, 0.4f), FV(X + 0.016f, 0.47f) }), 0.0145f, Hex(0x5E3A1C, 0.95f));
 				}
 				P.MEllipse(FV(0.42f, 0.62f), 0.3f, 0.07f, Hex(0xF2E0BE, 0.75f), 0.03f);
+				if (P.bHD)
+				{
+					// shifting chromatophore dots, fine wavy lines between the stripes and iridescent sheen
+					Speckle(P, FV(0.12f, 0.3f), FV(0.75f, 0.6f), 120, 0.002f, 0.006f, Hex(0x7A4A24, 0.6f), 251);
+					for (int32 i = 0; i < 7; ++i)
+					{
+						const float X = 0.15f + i * 0.075f + 0.035f;
+						P.MLine(Smooth({ FV(X + 0.008f, 0.31f), FV(X - 0.01f, 0.4f), FV(X + 0.012f, 0.47f) }), 0.0025f, Hex(0x8A5A30, 0.6f));
+					}
+					P.MEllipse(FV(0.44f, 0.5f), 0.22f, 0.05f, Hex(0x9AE0E8, 0.18f), 0.04f);
+					P.MEllipse(FV(0.36f, 0.56f), 0.14f, 0.03f, Hex(0xE8A0E0, 0.15f), 0.03f);
+				}
 				P.Gloss(FV(0.33f, 0.37f), 0.09f, 0.022f, 0.5f);
 			}
 			// W-shaped pupil
 			P.Ball(FV(0.68f, 0.44f), 0.058f, Hex(0xFFF0D0), 0.3f);
 			{
 				const TArray<FV> Pupil = { FV(0.648f, 0.43f), FV(0.664f, 0.46f), FV(0.68f, 0.43f), FV(0.696f, 0.46f), FV(0.712f, 0.43f) };
+				if (P.bHD)
+				{
+					P.Mark([](FV Q) { return FMath::Abs(SdCircle(Q, FV(0.68f, 0.44f), 0.05f)) - 0.004f; }, Hex(0xC8A060, 0.7f));
+					Speckle(P, FV(0.64f, 0.4f), FV(0.72f, 0.48f), 12, 0.002f, 0.004f, Hex(0xB08048, 0.7f), 252);
+				}
 				P.MLine(Pupil, 0.0095f, Ink);
 			}
 			break;
@@ -2392,12 +3501,42 @@ namespace
 					const FV A = Pos + Nrm * 0.1f, B = Pos - Nrm * 0.1f;
 					P.Glow([A, B](FV Q) { return SdCapsule(Q, A, B, 0.015f); }, Hex(0xE8C820), 0.03f, 0.8f);
 					P.MCapsule(A, B, 0.015f, Bright);
+					if (P.bHD)
+					{
+						// each band is a row of glowing electrocytes
+						for (int32 k = -3; k <= 3; ++k)
+						{
+							P.MCircle(Pos + Nrm * (k * 0.022f), 0.0045f, Hex(0xFFFFE8, 0.9f));
+						}
+					}
+				}
+				if (P.bHD)
+				{
+					// smooth wet skin: a dotted lateral line, fine dark flecks and a long specular streak
+					for (int32 i = 0; i < 60; ++i)
+					{
+						FV Pos, Tan;
+						Along(Path, i / 60.0f, Pos, Tan);
+						const FV Nrm(-Tan.Y, Tan.X);
+						P.MCircle(Pos + Nrm * 0.006f, 0.0025f, Hex(0xC8FFF8, 0.75f));
+						P.MCircle(Pos - Nrm * FMath::Lerp(R0, R1, i / 60.0f) * 0.55f, 0.004f, Hex(0xE8FFFF, 0.3f));
+						P.MCircle(Pos + Nrm * ((Rand01(260, i) - 0.5f) * 0.1f) + Tan * 0.01f, 0.003f, Hex(0x0A5A58, 0.6f));
+					}
 				}
 			}
 			// the head, then sparks
 			EelHead(P, FV(0.71f, 0.27f), -6.0f, 1.2f, Body, Hex(0x9BE4E0), Bright);
 			Bolt(P, FV(0.86f, 0.52f), 0.26f, Volt, 12.0f);
 			Bolt(P, FV(0.16f, 0.5f), 0.22f, Volt, -15.0f);
+			if (P.bHD)
+			{
+				// thin forked arcs crackling off the body
+				for (const TArray<FV>& Arc : { TArray<FV>{ FV(0.6f, 0.62f), FV(0.7f, 0.66f), FV(0.68f, 0.72f), FV(0.78f, 0.76f) }, TArray<FV>{ FV(0.24f, 0.72f), FV(0.2f, 0.62f), FV(0.24f, 0.6f), FV(0.2f, 0.55f) }, TArray<FV>{ FV(0.4f, 0.22f), FV(0.38f, 0.14f), FV(0.42f, 0.12f), FV(0.4f, 0.06f) } })
+				{
+					P.Glow([&Arc](FV Q) { return SdPolyline(Q, Arc, 0.004f); }, Hex(0xE0C010), 0.03f, 0.7f);
+					P.MLine(Arc, 0.004f, Hex(0xFFF8C0));
+				}
+			}
 			break;
 		}
 		default:
@@ -2761,8 +3900,14 @@ namespace
 		P.Blob({ FV(-0.3f, 0.14f), FV(-0.18f, 0.22f), FV(-0.36f, 0.42f), FV(-0.5f, 0.48f), FV(-0.44f, 0.32f) }, Hex(0xD8E4EC));
 	}
 
+#include "TDIconsHDSkills.inl"
+
 	void PaintSkill(FPainter& P, ETDTowerType Tower, int32 Index)
 	{
+		if (P.bHD && PaintSkillHD(P, Tower, Index))
+		{
+			return;
+		}
 		const FV Mid(0.5f, 0.5f);
 		switch (Tower)
 		{
@@ -3342,8 +4487,14 @@ namespace
 		}
 	}
 
+	bool PaintItemSlotHD(FPainter& P, int32 Slot);
+
 	void PaintItem(FPainter& P, ETDItemSlot Slot)
 	{
+		if (P.bHD && PaintItemSlotHD(P, (int32)Slot))
+		{
+			return;
+		}
 		switch (Slot)
 		{
 		case ETDItemSlot::Shell:
@@ -3492,6 +4643,17 @@ namespace
 		FClip Clip(P, [C, R](FV Q) { return SdCircle(Q, C, R); });
 		P.MEllipse(C + FV(R * 0.34f, R * 0.46f), R * 0.72f, R * 0.46f, Alpha(Shade, 0.55f), R * 0.4f);
 		P.MEllipse(C + FV(R * 0.5f, -R * 0.2f), R * 0.32f, R * 0.46f, Alpha(Sheen, 0.4f), R * 0.3f);
+		if (P.bHD)
+		{
+			// nacre: fine concentric growth lines and a soft rainbow orient shifting across the surface
+			for (int32 k = 1; k < 7; ++k)
+			{
+				P.Mark([C, R, k](FV Q) { return FMath::Abs(SdEllipse(Q, C + FV(R * 0.18f, R * 0.22f), R * (0.16f * k), R * (0.14f * k))) - R * 0.006f; }, Hex(0xFFFFFF, 0.05f));
+			}
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.7f, R * 0.12f, 120.0f, 200.0f); }, Hex(0x9AF0C8, 0.22f), R * 0.08f);
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.6f, R * 0.1f, 300.0f, 380.0f); }, Hex(0xFFB0E0, 0.22f), R * 0.08f);
+			P.Mark([C, R](FV Q) { return SdArc(Q, C, R * 0.85f, R * 0.06f, 60.0f, 110.0f); }, Hex(0xB0C8FF, 0.3f), R * 0.05f);
+		}
 		P.Gloss(C + FV(-R * 0.32f, -R * 0.38f), R * 0.3f, R * 0.2f, 0.95f);
 		P.Gloss(C + FV(-R * 0.08f, -R * 0.6f), R * 0.08f, R * 0.05f, 0.7f);
 	}
@@ -3499,6 +4661,11 @@ namespace
 	/** A spiral shell (whelk, conch, trumpet): stacked whorls from the tip at A to the wide body at B */
 	void SpiralShell(FPainter& P, FV A, FV B, float Width, const FLinearColor& Color, const FLinearColor& Band, int32 Whorls)
 	{
+		if (P.bHD)
+		{
+			HDSpiralShell(P, A, B, Width, Color, Band, Whorls);
+			return;
+		}
 		const FV D = (B - A).GetSafeNormal();
 		const FV N(-D.Y, D.X);
 		const float Len = (B - A).Size();
@@ -3530,6 +4697,27 @@ namespace
 			P.MLine(Smooth({ At - N * W, At + D * (W * 0.35f), At + N * W }), 0.012f, Alpha(Band, 0.9f));
 			P.MLine(Smooth({ At - N * W + D * 0.02f, At + D * (W * 0.35f + 0.02f), At + N * W + D * 0.02f }), 0.008f, Hex(0xFFFFFF, 0.35f));
 		}
+		if (P.bHD)
+		{
+			// fine growth lines between the whorls, spiral cords along the shell, and zigzag pigment flecks
+			for (int32 i = 0; i < Whorls * 4; ++i)
+			{
+				const float T = FMath::Pow((i + 0.5f) / (Whorls * 4 + 1), 0.85f);
+				const FV At = A + D * (Len * T);
+				const float W = Width * FMath::Pow(T, 0.8f) * 1.1f;
+				P.MLine(Smooth({ At - N * W, At + D * (W * 0.3f), At + N * W }), 0.0018f, Alpha(Band, 0.35f));
+			}
+			for (int32 k = -2; k <= 2; ++k)
+			{
+				P.MLine({ A, B + N * (Width * 0.35f * k) }, 0.0022f, Hex(0xFFFFFF, 0.18f));
+			}
+			for (int32 i = 0; i < 18; ++i)
+			{
+				const float T = 0.15f + Rand01(301, i) * 0.8f;
+				const FV At = A + D * (Len * T) + N * (Width * FMath::Pow(T, 0.8f) * (Rand01(302, i) - 0.5f) * 1.4f);
+				P.MLine({ At, At + D * 0.012f + N * 0.008f, At + D * 0.024f }, 0.003f, Alpha(Band, 0.6f));
+			}
+		}
 	}
 
 	/** Gold disc with a raised rim */
@@ -3543,6 +4731,33 @@ namespace
 		}
 		P.Circle(C, R * 0.78f, Gold);
 		P.Mark([C, R](FV Q) { return FMath::Abs(SdCircle(Q, C, R * 0.78f)) - R * 0.03f; }, Hex(0x8A5A18, 0.8f));
+		if (P.bHD)
+		{
+			// a beaded border, a struck trident and the wear of many hands
+			for (int32 i = 0; i < 24; ++i)
+			{
+				const FV At = C + Spin(FV(R * 0.89f, 0.0f), i * 15.0f);
+				P.MCircle(At, R * 0.045f, Hex(0xFFE9A0, 0.9f));
+				P.MCircle(At + FV(R * 0.012f, R * 0.016f), R * 0.03f, Hex(0x9A6A18, 0.6f));
+			}
+			FClip Clip(P, [C, R](FV Q) { return SdCircle(Q, C, R * 0.74f); });
+			const FLinearColor Emboss = Hex(0x9A6A18, 0.85f), Lift = Hex(0xFFF4C0, 0.8f);
+			for (const FV Off : { FV(0.012f, 0.016f), FV(0.0f, 0.0f) })
+			{
+				const FLinearColor Col = Off.X > 0.0f ? Emboss : Lift;
+				P.MCapsule(C + (FV(0.0f, -0.42f) + Off) * R, C + (FV(0.0f, 0.5f) + Off) * R, R * 0.05f, Col);
+				P.MArc(C + (FV(0.0f, -0.32f) + Off) * R, R * 0.26f, R * 0.07f, 0.0f, 180.0f, Col);
+				for (const float X : { -0.26f, 0.0f, 0.26f })
+				{
+					P.MPoly({ C + (FV(X - 0.07f, -0.36f) + Off) * R, C + (FV(X, -0.56f) + Off) * R, C + (FV(X + 0.07f, -0.36f) + Off) * R }, Col);
+				}
+			}
+			for (int32 i = 0; i < 6; ++i)
+			{
+				const FV At = C + FV((Rand01(311, i) - 0.5f) * R * 1.2f, (Rand01(312, i) - 0.5f) * R * 1.2f);
+				P.MCapsule(At, At + Spin(FV(R * 0.18f, 0.0f), Rand01(313, i) * 180.0f), R * 0.008f, Hex(0xFFFFFF, 0.45f));
+			}
+		}
 	}
 
 	/** Gold-orange halo behind a unique legendary */
@@ -3551,8 +4766,14 @@ namespace
 		P.Glow([](FV Q) { return SdCircle(Q, FV(0.5f, 0.5f), 0.36f); }, Hex(0xFFB040), 0.14f, 0.6f);
 	}
 
+#include "TDIconsHDItems.inl"
+
 	void PaintItemKind(FPainter& P, int32 Kind)
 	{
+		if (P.bHD && PaintItemKindHD(P, Kind))
+		{
+			return;
+		}
 		switch (Kind)
 		{
 		// ---------------- shells ----------------
@@ -4596,6 +5817,10 @@ namespace
 
 	void PaintMisc(FPainter& P, ETDMiscIcon Icon)
 	{
+		if (P.bHD && PaintMiscHD(P, (int32)Icon))
+		{
+			return;
+		}
 		switch (Icon)
 		{
 		case ETDMiscIcon::Pearl:
@@ -4621,6 +5846,15 @@ namespace
 			P.MCircle(FV(0.85f, 0.36f), 0.03f, Hex(0xE4FAFF));
 			P.MCircle(FV(0.76f, 0.33f), 0.022f, Hex(0xE4FAFF));
 			P.MCircle(FV(0.68f, 0.34f), 0.018f, Hex(0xE4FAFF));
+			if (P.bHD)
+			{
+				// foam lace, spray droplets and current lines in the swell
+				Speckle(P, FV(0.2f, 0.18f), FV(0.9f, 0.42f), 50, 0.003f, 0.009f, Hex(0xFFFFFF, 0.9f), 331);
+				for (int32 k = 0; k < 5; ++k)
+				{
+					P.MLine(Smooth({ FV(0.1f + k * 0.02f, 0.7f + k * 0.02f), FV(0.3f, 0.62f + k * 0.03f), FV(0.5f, 0.68f + k * 0.03f), FV(0.62f, 0.62f + k * 0.04f) }), 0.003f, Hex(0xB8ECFF, 0.4f));
+				}
+			}
 			break;
 		}
 		case ETDMiscIcon::SkillPoint:
@@ -4634,6 +5868,18 @@ namespace
 				P.Fill([&Pts](FV Q) { return SdPoly(Q, Pts) - 0.015f; }, Gold);
 			}
 			P.Star(FV(0.0f, 0.02f), 0.22f, 0.1f, 5, -90.0f, Hex(0xFFEFB0));
+			if (P.bHD)
+			{
+				// faceted like a cut gem: a lit and a shaded half on every arm, and a starburst glint
+				for (int32 i = 0; i < 5; ++i)
+				{
+					const FV Tip = Spin(FV(0.48f, 0.0f), -90.0f + i * 72.0f) + FV(0.0f, 0.02f);
+					const FV Left = Spin(FV(0.2f, 0.0f), -90.0f + i * 72.0f - 36.0f) + FV(0.0f, 0.02f);
+					P.MPoly({ FV(0.0f, 0.02f), Tip, Left }, Hex(0xFFFFFF, i < 2 || i == 4 ? 0.2f : 0.05f));
+					P.MPoly({ FV(0.0f, 0.02f), Tip, Spin(FV(0.2f, 0.0f), -90.0f + i * 72.0f + 36.0f) + FV(0.0f, 0.02f) }, Hex(0x7A4A00, 0.18f));
+				}
+				Glint(P, FV(-0.16f, -0.16f), 0.18f);
+			}
 			break;
 		}
 		case ETDMiscIcon::Logo:
@@ -4677,7 +5923,6 @@ namespace
 					}
 				}
 			}
-			Harpoon(P, FV(0.54f, 0.38f), 0.9f, -45.0f);
 			if (!bTiny)
 			{
 				Bubble(P, FV(0.24f, 0.34f), bSmall ? 0.06f : 0.05f);
@@ -4698,6 +5943,8 @@ namespace
 			}, Hex(0xFFFFFF, 0.55f));
 			if (bSmall)
 			{
+				// the harpoon is drawn last so it breaks out in front of the rim
+				Harpoon(P, FV(0.54f, 0.38f), 0.9f, -45.0f);
 				break;
 			}
 			P.Mark([](FV Q) { return FMath::Abs(SdCircle(Q, FV(0.5f, 0.5f), 0.425f)) - 0.005f; }, Hex(0x9FE6FF, 0.3f));
@@ -4707,6 +5954,8 @@ namespace
 				const float A = FMath::DegreesToRadians(-70.0f + i * 16.0f);
 				Bubble(P, FV(0.5f + FMath::Cos(A) * 0.39f, 0.5f + FMath::Sin(A) * 0.39f), i % 2 ? 0.016f : 0.022f);
 			}
+			// the harpoon is drawn last so it breaks out in front of the rim
+			Harpoon(P, FV(0.54f, 0.38f), 0.9f, -45.0f);
 			break;
 		}
 		default:
@@ -4723,6 +5972,8 @@ namespace
 		P.Mark([](FV Q) { return FMath::Abs(SdCircle(Q, FV(0.5f, 0.5f), 0.46f)) - 0.012f; }, Hex(0xB0306A, 0.7f));
 	}
 
+#include "TDIconsHDBoons.inl"
+
 	void PaintBoon(FPainter& P, int32 Id)
 	{
 		const FLinearColor Coral = Hex(0xFF7A6A);
@@ -4732,6 +5983,10 @@ namespace
 		if (Id >= (int32)ETDBoon::BloodTide)
 		{
 			CurseAura(P);
+		}
+		if (P.bHD && PaintBoonHD(P, Id))
+		{
+			return;
 		}
 		switch ((ETDBoon)Id)
 		{
@@ -5032,6 +6287,50 @@ namespace
 		return Out;
 	}
 
+	// ---- HUD decorations (always the HD art; the detailed interface draws them) ----
+
+	void PaintDecor(FPainter& P, ETDDecorIcon Icon)
+	{
+		switch (Icon)
+		{
+		case ETDDecorIcon::Starfish:
+			// a coral-orange sea star with rows of cream knobs
+			HDSeaStar(P, FV(0.5f, 0.5f), 0.44f, Hex(0xEC6A44), Hex(0xFFE2C4), 2101);
+			break;
+		case ETDDecorIcon::Scallop:
+			// a peach scallop, its ribs fanning up from the hinge
+			HDScallopValve(P, FV(0.5f, 0.74f), 0.5f, Hex(0xF6B48C), Hex(0xE8805A), 2102);
+			break;
+		case ETDDecorIcon::Coral:
+			// a pink coral sprig: a stout trunk forking into two arms, one of them forking again
+			HDCoralBranches(P, FV(0.5f, 0.95f), 0.36f, 0.075f, -6.0f, 1, Hex(0xF07090), 2103);
+			HDCoralBranches(P, FV(0.47f, 0.7f), 0.16f, 0.045f, -58.0f, 0, Hex(0xF07090), 2104);
+			break;
+		default:
+			break;
+		}
+	}
+
+	/** Bumped whenever the icon art changes in a way the source hash would miss */
+	constexpr uint32 IconCacheVersion = 2;
+
+	/** The disk cache for painted icons at one detail level: the HD look takes seconds to paint, so it is kept between runs */
+	FString IconCachePath(int32 Level)
+	{
+		return FPaths::ProjectSavedDir() / TEXT("IconCache") / FString::Printf(TEXT("Icons_L%d.bin"), Level);
+	}
+
+	/** Identifies the painter's source and the icon set */
+	FString IconCacheStamp(int32 Level)
+	{
+		FString Counts;
+		for (int32 Kind = 0; Kind <= (int32)ETDIcon::Decor; ++Kind)
+		{
+			Counts += FString::Printf(TEXT("%d,"), TDIcons::Count((ETDIcon)Kind));
+		}
+		return FString::Printf(TEXT("%u|%s|%d|%d|%s"), IconCacheVersion, TEXT(ATD_ICON_SOURCE_HASH), Level, TDIcons::TextureSize, *Counts);
+	}
+
 	TMap<uint32, UTexture2D*>& Cache()
 	{
 		static TMap<uint32, UTexture2D*> Textures;
@@ -5043,14 +6342,27 @@ namespace
 		return ((uint32)Kind << 16) | (uint32)(Id & 0xFFFF);
 	}
 
-	/** Pixels painted ahead of time, waiting to become textures */
+	/** Pixels painted ahead of time, waiting to become textures (the painting task fills it, so only touch it under PendingLock) */
+	FCriticalSection PendingLock;
 	TMap<uint32, TArray<FColor>>& Pending()
 	{
 		static TMap<uint32, TArray<FColor>> Painted;
 		return Painted;
 	}
 
-	bool bPaintedAll = false;
+	/** Game thread: whether this look's icons were loaded or their painting started */
+	bool bPaintStarted = false;
+	/** Bumped by FlushIcons, so a task still painting the old look throws its work away */
+	std::atomic<uint32> PaintGeneration{ 1 };
+	/** The generation whose icons are all in Pending (or made); until then Get leaves the rest blank instead of painting them itself */
+	std::atomic<uint32> PaintDoneGeneration{ 0 };
+	std::atomic<bool> bPaintShutdown{ false };
+	/** Game thread: painting tasks that may still run (waited for at exit) */
+	TArray<UE::Tasks::FTask>& PaintTasks()
+	{
+		static TArray<UE::Tasks::FTask> Tasks;
+		return Tasks;
+	}
 
 	/** Drops every cached icon texture, so the next Get paints them again (after atd.DetailedIcons changes) */
 	void FlushIcons()
@@ -5063,54 +6375,173 @@ namespace
 			}
 		}
 		Cache().Reset();
-		Pending().Reset();
-		bPaintedAll = false;
+		++PaintGeneration;
+		{
+			FScopeLock Lock(&PendingLock);
+			Pending().Reset();
+		}
+		bPaintStarted = false;
 	}
 
 	TAutoConsoleVariable<int32> CVarDetailedIcons(
 		TEXT("atd.DetailedIcons"),
-		1,
-		TEXT("1 paints every HUD icon with the detailed look (finer edges, cast shadows between parts, catch and bounce light, surface texture, a soft drop shadow); 0 the original look."),
+		2,
+		TEXT("2 paints every HUD icon with the hand-drawn HD art (painted at four times the size, with contact shadows and crevices); 1 the detailed look (finer edges, cast shadows between parts, catch and bounce light, surface texture, a soft drop shadow); 0 the original look."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { FlushIcons(); }));
 
-	/** Paints every icon the HUD can show on all cores at once, so opening a panel never hitches later */
+	/** Writes painted icons to the disk cache for the next run */
+	void SaveIconCache(const FString& CachePath, const FString& Stamp, TMap<uint32, TArray<FColor>>& Icons)
+	{
+		TArray<uint8> Raw;
+		FMemoryWriter Writer(Raw);
+		int32 Count = Icons.Num();
+		Writer << Count;
+		for (TPair<uint32, TArray<FColor>>& Entry : Icons)
+		{
+			Writer << Entry.Key;
+			Writer.Serialize(Entry.Value.GetData(), Entry.Value.Num() * sizeof(FColor));
+		}
+		int32 PackedSize = FCompression::CompressMemoryBound(NAME_Zlib, Raw.Num());
+		TArray<uint8> Packed;
+		FMemoryWriter Header(Packed);
+		FString SavedStamp = Stamp;
+		int32 RawSize = Raw.Num();
+		Header << SavedStamp << RawSize;
+		const int64 Offset = Packed.Num();
+		Packed.AddUninitialized(PackedSize);
+		if (FCompression::CompressMemory(NAME_Zlib, Packed.GetData() + Offset, PackedSize, Raw.GetData(), Raw.Num()))
+		{
+			Packed.SetNum(Offset + PackedSize);
+			IFileManager::Get().MakeDirectory(*FPaths::GetPath(CachePath), true);
+			FFileHelper::SaveArrayToFile(Packed, *CachePath);
+		}
+	}
+
+	/** Loads this look's icons from the disk cache, or else starts painting them all on the worker threads (the HD look takes seconds of
+	 *  every core): the first screen's icons (logo, decorations, then the dock) arrive first and the rest stay blank until they're painted,
+	 *  so the game never waits for them */
 	void PaintAllOnce()
 	{
-		if (bPaintedAll)
+		if (bPaintStarted)
 		{
 			return;
 		}
-		bPaintedAll = true;
+		bPaintStarted = true;
+		const uint32 Generation = PaintGeneration.load();
 		const double Start = FPlatformTime::Seconds();
+		const int32 Level = TDIcons::DetailLevel();
+		const FString CachePath = IconCachePath(Level);
+		const FString Stamp = IconCacheStamp(Level);
 
-		struct FJob
+		// painted on an earlier run from the same icon source: just load the pixels
 		{
-			ETDIcon Kind;
-			int32 Id;
-			TArray<FColor> Pixels;
-			bool bOk;
-		};
-		TArray<FJob> Jobs;
-		const ETDIcon Kinds[] = { ETDIcon::Tower, ETDIcon::Enemy, ETDIcon::Skill, ETDIcon::Item, ETDIcon::Misc, ETDIcon::ItemKind, ETDIcon::Boon };
-		for (ETDIcon Kind : Kinds)
-		{
-			for (int32 Id = 0; Id < TDIcons::Count(Kind); ++Id)
+			TArray<uint8> Packed;
+			if (FFileHelper::LoadFileToArray(Packed, *CachePath, FILEREAD_Silent) && Packed.Num() > 8)
 			{
-				Jobs.Add(FJob{ Kind, Id, {}, false });
+				FMemoryReader Header(Packed);
+				FString SavedStamp;
+				int32 RawSize = 0;
+				Header << SavedStamp << RawSize;
+				const int64 Offset = Header.Tell();
+				TArray<uint8> Raw;
+				if (!Header.IsError() && SavedStamp == Stamp && RawSize > 0 && RawSize < 256 * 1024 * 1024)
+				{
+					Raw.SetNumUninitialized(RawSize);
+					if (FCompression::UncompressMemory(NAME_Zlib, Raw.GetData(), RawSize, Packed.GetData() + Offset, Packed.Num() - Offset))
+					{
+						FMemoryReader Reader(Raw);
+						int32 Count = 0;
+						Reader << Count;
+						TMap<uint32, TArray<FColor>> Loaded;
+						for (int32 i = 0; i < Count && !Reader.IsError(); ++i)
+						{
+							uint32 Key = 0;
+							Reader << Key;
+							TArray<FColor>& Pixels = Loaded.Add(Key);
+							Pixels.SetNumUninitialized(TDIcons::TextureSize * TDIcons::TextureSize);
+							Reader.Serialize(Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+						}
+						if (!Reader.IsError() && Loaded.Num() == Count)
+						{
+							{
+								FScopeLock Lock(&PendingLock);
+								Pending().Append(MoveTemp(Loaded));
+							}
+							PaintDoneGeneration = Generation;
+							UE_LOG(LogAquaticTowerDefense, Log, TEXT("Loaded %d painted icons from %s in %.0f ms"), Count, *CachePath, (FPlatformTime::Seconds() - Start) * 1000.0);
+							return;
+						}
+					}
+				}
 			}
 		}
-		ParallelFor(Jobs.Num(), [&Jobs](int32 i)
+
+		// wait for any painting task at exit (each icon takes up to a second, and the task reads this file's statics)
+		static bool bExitHook = false;
+		if (!bExitHook)
 		{
-			Jobs[i].bOk = TDIcons::Render(Jobs[i].Kind, Jobs[i].Id, TDIcons::TextureSize, Jobs[i].Pixels);
-		});
-		for (FJob& Job : Jobs)
-		{
-			if (Job.bOk)
+			bExitHook = true;
+			FCoreDelegates::OnPreExit.AddLambda([]()
 			{
-				Pending().Add(CacheKey(Job.Kind, Job.Id), MoveTemp(Job.Pixels));
-			}
+				bPaintShutdown = true;
+				UE::Tasks::Wait(PaintTasks());
+				PaintTasks().Reset();
+			});
 		}
-		UE_LOG(LogAquaticTowerDefense, Log, TEXT("Painted %d icons (%s) in %.0f ms"), Jobs.Num(), TDIcons::UseDetailed() ? TEXT("detailed") : TEXT("original"), (FPlatformTime::Seconds() - Start) * 1000.0);
+		PaintTasks().RemoveAll([](const UE::Tasks::FTask& Task) { return Task.IsCompleted(); });
+
+		PaintTasks().Add(UE::Tasks::Launch(UE_SOURCE_LOCATION, [Generation, Level, CachePath, Stamp, Start]()
+		{
+			auto Stale = [Generation]() { return bPaintShutdown.load() || PaintGeneration.load() != Generation; };
+			// what the first screen shows first: the menu's logo and decorations, then the dock, then the panels. Each icon is handed
+			// out on its own in this order and shows as soon as it is painted.
+			const ETDIcon Order[] = { ETDIcon::Misc, ETDIcon::Decor, ETDIcon::Tower, ETDIcon::Item, ETDIcon::ItemKind, ETDIcon::Skill, ETDIcon::Boon, ETDIcon::Enemy };
+			struct FJob
+			{
+				ETDIcon Kind;
+				int32 Id;
+				TArray<FColor> Pixels;
+				bool bOk = false;
+			};
+			TArray<FJob> Jobs;
+			for (ETDIcon Kind : Order)
+			{
+				for (int32 Id = 0; Id < TDIcons::Count(Kind); ++Id)
+				{
+					Jobs.Add(FJob{ Kind, Id });
+				}
+			}
+			ParallelFor(Jobs.Num(), [&Jobs, &Stale, Level](int32 i)
+			{
+				FJob& Job = Jobs[i];
+				if (Stale())
+				{
+					return;
+				}
+				Job.bOk = TDIcons::Render(Job.Kind, Job.Id, TDIcons::TextureSize, Job.Pixels, Level);
+				FScopeLock Lock(&PendingLock);
+				if (Job.bOk && !Stale())
+				{
+					Pending().Add(CacheKey(Job.Kind, Job.Id), Job.Pixels);
+				}
+			}, EParallelForFlags::Unbalanced);
+			if (Stale())
+			{
+				return;
+			}
+			PaintDoneGeneration = Generation;
+			UE_LOG(LogAquaticTowerDefense, Log, TEXT("Painted %d icons (%s) in the background in %.0f ms"), Jobs.Num(),
+				Level >= 2 ? TEXT("HD") : (Level >= 1 ? TEXT("detailed") : TEXT("original")), (FPlatformTime::Seconds() - Start) * 1000.0);
+			TMap<uint32, TArray<FColor>> All;
+			for (FJob& Job : Jobs)
+			{
+				if (Job.bOk)
+				{
+					All.Add(CacheKey(Job.Kind, Job.Id), MoveTemp(Job.Pixels));
+				}
+			}
+			SaveIconCache(CachePath, Stamp, All);
+		}));
 	}
 }
 
@@ -5125,6 +6556,7 @@ int32 TDIcons::Count(ETDIcon Kind)
 	case ETDIcon::Misc:		return (int32)ETDMiscIcon::Count;
 	case ETDIcon::ItemKind:	return TD::ItemKindCount() + 1;	// id = item type, 0 has no icon
 	case ETDIcon::Boon:		return TD::BoonCount;
+	case ETDIcon::Decor:	return (int32)ETDDecorIcon::Count;
 	default:				return 0;
 	}
 }
@@ -5132,6 +6564,11 @@ int32 TDIcons::Count(ETDIcon Kind)
 bool TDIcons::UseDetailed()
 {
 	return CVarDetailedIcons.GetValueOnAnyThread() != 0;
+}
+
+int32 TDIcons::DetailLevel()
+{
+	return FMath::Clamp(CVarDetailedIcons.GetValueOnAnyThread(), 0, 2);
 }
 
 bool TDIcons::Render(ETDIcon Kind, int32 Id, int32 Size, TArray<FColor>& OutPixels, int32 Detail)
@@ -5160,13 +6597,17 @@ bool TDIcons::Render(ETDIcon Kind, int32 Id, int32 Size, TArray<FColor>& OutPixe
 		case ETDIcon::Misc:		PaintMisc(P, (ETDMiscIcon)Id); break;
 		case ETDIcon::ItemKind:	PaintItemKind(P, Id); break;
 		case ETDIcon::Boon:		PaintBoon(P, Id); break;
+		case ETDIcon::Decor:	PaintDecor(P, (ETDDecorIcon)Id); break;
 		}
 	};
 
 	const bool bLogo = Kind == ETDIcon::Misc && Id == (int32)ETDMiscIcon::Logo;
 	// small sizes are painted large and filtered down, so fine detail averages out instead of aliasing
-	const bool bDetailed = Detail < 0 ? UseDetailed() : Detail > 0;
-	FPainter P(FMath::Max(Size, TextureSize) * (bDetailed ? 2 : 1), bDetailed);
+	const int32 Level = Kind == ETDIcon::Decor ? 2 : (Detail < 0 ? DetailLevel() : Detail);
+	const bool bDetailed = Level > 0;
+	const bool bHD = Level >= 2;
+	FPainter P(FMath::Max(Size, TextureSize) * (bHD ? 4 : (bDetailed ? 2 : 1)), bDetailed);
+	P.bHD = bHD;
 	P.bDropShadow = !bLogo;
 	if (!bLogo)
 	{
@@ -5174,6 +6615,7 @@ bool TDIcons::Render(ETDIcon Kind, int32 Id, int32 Size, TArray<FColor>& OutPixe
 		// the draft sees -0.5..1.5, so art painted past the tile's edge is measured (and pulled back in), not clipped
 		FPainter Draft(96);
 		Draft.bMeasuring = true;
+		Draft.bHD = bHD;	// measure the art that will actually be painted
 		Draft.FrameS = 0.5f;
 		Draft.FrameT = FV(0.25f, 0.25f);
 		Paint(Draft);
@@ -5206,7 +6648,16 @@ UTexture2D* TDIcons::Get(ETDIcon Kind, int32 Id)
 
 	UTexture2D* Texture = nullptr;
 	TArray<FColor> Pixels;
-	const bool bPainted = Pending().RemoveAndCopyValue(Key, Pixels) || Render(Kind, Id, TextureSize, Pixels);
+	bool bPainted = false;
+	{
+		FScopeLock Lock(&PendingLock);
+		bPainted = Pending().RemoveAndCopyValue(Key, Pixels);
+	}
+	if (!bPainted && PaintDoneGeneration.load() != PaintGeneration.load())
+	{
+		return nullptr;	// still being painted in the background: blank for now (not cached, so it shows once painted)
+	}
+	bPainted = bPainted || Render(Kind, Id, TextureSize, Pixels);
 	if (bPainted)
 	{
 		const FName Name = MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), FName(*FString::Printf(TEXT("TDIcon_%d_%d"), (int32)Kind, Id)));
@@ -5283,13 +6734,33 @@ namespace
 			}
 		}
 
-		int32 Row = 0;
+		// paint every icon on all cores first (the HD look is slow), then lay them out
+		TArray<TPair<ETDIcon, int32>> Ids;
 		for (ETDIcon Kind : Kinds)
 		{
 			for (int32 Id = 0; Id < TDIcons::Count(Kind); ++Id)
 			{
-				TArray<FColor> Pixels;
-				if (!TDIcons::Render(Kind, Id, Cell, Pixels))
+				Ids.Add({ Kind, Id });
+			}
+		}
+		TArray<TArray<FColor>> Painted;
+		Painted.SetNum(Ids.Num());
+		ParallelFor(Ids.Num(), [&](int32 i)
+		{
+			if (!TDIcons::Render(Ids[i].Key, Ids[i].Value, Cell, Painted[i]))
+			{
+				Painted[i].Reset();
+			}
+		});
+
+		int32 Row = 0;
+		int32 Next = 0;
+		for (ETDIcon Kind : Kinds)
+		{
+			for (int32 Id = 0; Id < TDIcons::Count(Kind); ++Id)
+			{
+				const TArray<FColor>& Pixels = Painted[Next++];
+				if (Pixels.Num() != Cell * Cell)
 				{
 					continue;
 				}
@@ -5446,6 +6917,13 @@ bool TDIcons::ExportCompare(const FString& Directory)
 	bOk &= WriteCompareSheet(Directory / TEXT("Compare_Items.png"), Items, 128, 4);
 	bOk &= WriteCompareSheet(Directory / TEXT("Compare_HUD42px.png"), All, 42, 8);
 	return bOk;
+}
+
+bool TDIcons::ExportFamily(ETDIcon Kind, const FString& Path, int32 Cell, int32 Columns)
+{
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+	const ETDIcon Kinds[] = { Kind };
+	return WriteSheet(Path, Kinds, Cell, Columns);
 }
 
 bool TDIcons::Export(const FString& Directory)

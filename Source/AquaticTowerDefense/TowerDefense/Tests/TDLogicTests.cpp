@@ -14,6 +14,7 @@
 #include "TDIcons.h"
 #include "TDGameMode.h"
 #include "TDEnemy.h"
+#include "TDAudio.h"
 #include "Kismet/GameplayStatics.h"
 #include "Sound/SoundWave.h"
 
@@ -1410,15 +1411,38 @@ bool FATDMasteryTest::RunTest(const FString& Parameters)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FATDBossMusicTest, "ATD.Logic.Audio.BossLoop", ATDTestFlags)
 bool FATDBossMusicTest::RunTest(const FString& Parameters)
 {
-	// the boss loop crossfades with the ambient loop in step, so both must exist and be just as long
-	const USoundWave* Ambient = LoadObject<USoundWave>(nullptr, TEXT("/Game/AquaticTowerDefense/Audio/S_Music.S_Music"));
-	const USoundWave* Boss = LoadObject<USoundWave>(nullptr, TEXT("/Game/AquaticTowerDefense/Audio/S_MusicBoss.S_MusicBoss"));
-	if (!TestNotNull(TEXT("Ambient loop"), Ambient) || !TestNotNull(TEXT("Boss loop"), Boss))
+	auto LoadSound = [](const FString& Name)
 	{
-		return false;
+		return LoadObject<USoundWave>(nullptr, *FString::Printf(TEXT("/Game/AquaticTowerDefense/Audio/%s.%s"), *Name, *Name));
+	};
+
+	// every effect, shot, death sound and music loop the game asks for exists (a missing one would play silence or the fallback)
+	for (const FString& Name : TDAudio::AllSoundNames())
+	{
+		TestNotNull(*FString::Printf(TEXT("Sound %s"), *Name), LoadSound(Name));
 	}
-	TestEqual(TEXT("Same length, so the loops stay in step"), Boss->Duration, Ambient->Duration, 0.01f);
-	TestEqual(TEXT("48 second loop"), Boss->Duration, 48.0f, 0.05f);
+
+	// each music set's boss loop crossfades with its ambient loop in step, so both must be just as long
+	const TCHAR* Ambients[TDAudio::MusicSetCount] = { TEXT("S_Music"), TEXT("S_Music2"), TEXT("S_Music3") };
+	const TCHAR* Bosses[TDAudio::MusicSetCount] = { TEXT("S_MusicBoss"), TEXT("S_MusicBoss2"), TEXT("S_MusicBoss3") };
+	for (int32 Set = 0; Set < TDAudio::MusicSetCount; ++Set)
+	{
+		const USoundWave* Ambient = LoadSound(Ambients[Set]);
+		const USoundWave* Boss = LoadSound(Bosses[Set]);
+		if (!TestNotNull(TEXT("Ambient loop"), Ambient) || !TestNotNull(TEXT("Boss loop"), Boss))
+		{
+			continue;
+		}
+		TestEqual(*FString::Printf(TEXT("Set %d loops the same length, so they stay in step"), Set), Boss->Duration, Ambient->Duration, 0.01f);
+		TestEqual(*FString::Printf(TEXT("Set %d is a 48 second loop"), Set), Boss->Duration, 48.0f, 0.05f);
+	}
+
+	// every map plays a real set
+	for (int32 Map = 0; Map < TD::MapCount; ++Map)
+	{
+		const int32 Set = TDAudio::MusicSetForMap(Map);
+		TestTrue(*FString::Printf(TEXT("Map %d has a music set"), Map), Set >= 0 && Set < TDAudio::MusicSetCount);
+	}
 	return true;
 }
 
@@ -1544,6 +1568,29 @@ bool FATDMotionTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("A swimmer ends on the floor"), Swimmer.Drop, 1.0f);
 	TestTrue(TEXT("A swimmer spirals"), Swimmer.Spin >= 360.0f);
 	TestTrue(TEXT("Past the end it holds the last pose"), TD::DeathPose(3.0f, false).Sink == Crawler.Sink);
+	TestEqual(TEXT("A death starts at full size"), Start.Scale * Start.Squash, 1.0f);
+	TestTrue(TEXT("The killing blow squashes"), TD::DeathPose(0.06f, false).Squash < 0.85f);
+	TestTrue(TEXT("A crawler is thrown up as it flips"), TD::DeathPose(0.17f, false).Hop > 10.0f);
+	TestEqual(TEXT("A crawler has landed by the end"), Crawler.Hop, 0.0f);
+	TestTrue(TEXT("It shrinks as it sinks, but not away"), Crawler.Scale < 0.8f && Crawler.Scale > 0.5f && Swimmer.Scale == Crawler.Scale);
+	TestEqual(TEXT("Limbs end slack"), Swimmer.Limp, 1.0f);
+
+	// tower shot kick: snaps out at once, settles back through a small overshoot, rests at zero
+	TestEqual(TEXT("No kick before a shot"), TD::RecoilCurve(0.0f), 0.0f);
+	TestTrue(TEXT("The kick peaks almost at once"), TD::RecoilCurve(0.08f) > 0.99f);
+	float Lowest = 1.0f;
+	for (int32 i = 1; i < 100; ++i)
+	{
+		Lowest = FMath::Min(Lowest, TD::RecoilCurve(i / 100.0f));
+	}
+	TestTrue(TEXT("The kick overshoots rest a little"), Lowest < -0.05f && Lowest > -0.3f);
+	TestTrue(TEXT("The kick has settled near the end"), FMath::Abs(TD::RecoilCurve(0.97f)) < 0.01f);
+	TestEqual(TEXT("No kick after it"), TD::RecoilCurve(1.0f), 0.0f);
+
+	// spawn pop: grows from small, overshoots, ends at full size
+	TestTrue(TEXT("A new creature starts small"), TD::SpawnPopScale(0.0f) < 0.35f);
+	TestTrue(TEXT("It overshoots on the way"), TD::SpawnPopScale(TD::SpawnPopSeconds * 0.75f) > 1.0f);
+	TestEqual(TEXT("Then it is full size"), TD::SpawnPopScale(TD::SpawnPopSeconds), 1.0f);
 	return true;
 }
 

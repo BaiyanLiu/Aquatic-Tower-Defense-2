@@ -103,7 +103,29 @@ FTDGallery::FTDGallery(ATDPlayerController* InPC, int32 InPairsPerPage, int32 In
 	, First(InFirst < 0 ? 0 : FMath::Min(InFirst, (int32)ETDModel::Count - 1))
 	, Last(InLast < 0 ? (int32)ETDModel::Count - 1 : FMath::Clamp(InLast, 0, (int32)ETDModel::Count - 1))
 {
-	Next = First;
+	// -ATDGalleryList=3+4+54 shows only those models, in that order
+	FString List;
+	if (FParse::Value(FCommandLine::Get(), TEXT("ATDGalleryList="), List))
+	{
+		TArray<FString> Items;
+		List.ParseIntoArray(Items, TEXT("+"));
+		for (const FString& Item : Items)
+		{
+			const int32 Id = FCString::Atoi(*Item);
+			if (Id >= 0 && Id < (int32)ETDModel::Count)
+			{
+				Ids.Add(Id);
+			}
+		}
+	}
+	if (Ids.Num() == 0)
+	{
+		for (int32 Id = First; Id <= Last; ++Id)
+		{
+			Ids.Add(Id);
+		}
+	}
+	Next = 0;
 	Timer = 1.0f;
 	UE_LOG(LogAquaticTowerDefense, Display, TEXT("GALLERY models %d to %d, %d per page"), First, Last, PairsPerPage);
 }
@@ -124,14 +146,14 @@ void FTDGallery::BuildPage()
 {
 	ATDPlayerController* P = PC.Get();
 	UWorld* World = P->GetWorld();
-	const int32 Count = FMath::Min(PairsPerPage, Last - Next + 1);
+	const int32 Count = FMath::Min(PairsPerPage, Ids.Num() - Next);
 	const int32 Cols = Count <= 2 ? Count : FMath::DivideAndRoundUp(Count, 2);
 	const int32 Rows = FMath::DivideAndRoundUp(Count, Cols);
 
 	float Reach = 20.0f, Height = 20.0f;
 	for (int32 i = 0; i < Count; ++i)
 	{
-		const FVector2D Extent = ModelExtent((ETDModel)(Next + i));
+		const FVector2D Extent = ModelExtent((ETDModel)Ids[Next + i]);
 		Reach = FMath::Max(Reach, Extent.X);
 		Height = FMath::Max(Height, Extent.Y);
 	}
@@ -154,7 +176,7 @@ void FTDGallery::BuildPage()
 	FString PageNames;
 	for (int32 i = 0; i < Count; ++i)
 	{
-		const ETDModel Id = (ETDModel)(Next + i);
+		const ETDModel Id = (ETDModel)Ids[Next + i];
 		const int32 Col = i % Cols;
 		const int32 Row = i / Cols;
 		const FVector Center = GalleryOrigin + Right * ((Col - (Cols - 1) * 0.5f) * CellW) + Ahead * (((Rows - 1) * 0.5f - Row) * CellD);
@@ -184,7 +206,9 @@ void FTDGallery::BuildPage()
 	{
 		Aspect = (float)SizeX / SizeY;
 	}
-	const float OrthoWidth = FMath::Max(Cols * CellW, Rows * CellScreenH * Aspect) * 1.04f;
+	float OrthoWidth = FMath::Max(Cols * CellW, Rows * CellScreenH * Aspect) * 1.04f;
+	// -ATDGalleryOrtho=<width> shows the models at a game zoom instead (1300 = the default view, 3000 = zoomed all the way out)
+	FParse::Value(FCommandLine::Get(), TEXT("ATDGalleryOrtho="), OrthoWidth);
 	const FVector LookAt = GalleryOrigin + FVector(0.0f, 0.0f, Height * 0.35f) - Ahead * Reach * 0.4f;
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -216,7 +240,7 @@ bool FTDGallery::Tick(float RealDeltaTime)
 	if (Phase == 0)
 	{
 		ClearPage();
-		if (Next > Last)
+		if (Next >= Ids.Num())
 		{
 			P->SetViewTarget(P->GetPawn());
 			if (AHUD* HUD = P->GetHUD())

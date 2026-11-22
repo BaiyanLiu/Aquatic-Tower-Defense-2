@@ -180,6 +180,11 @@ public:
 	UFUNCTION(Exec)
 	void ATDShot(float Delay);
 
+	/** Dev: times tower and wall placement on the current board after Delay seconds (game-thread ms per placement, then any long frames
+	 *  for 10 s), logging PLACEBENCH lines */
+	UFUNCTION(Exec)
+	void ATDPlaceBench(float Delay = 0.0f);
+
 	/** Console helper: selects a tower type and holds the cursor over a tile (shows the placement ghost) */
 	UFUNCTION(Exec)
 	void ATDPreview(int32 TowerType, int32 X, int32 Y);
@@ -215,6 +220,10 @@ public:
 	/** Console helper: writes a contact sheet of all icons and the Windows app icon to Saved/Icons */
 	UFUNCTION(Exec)
 	void ATDExportIcons();
+
+	/** Console helper: writes one icon family (ETDIcon number) at the current atd.DetailedIcons level to Saved/Icons/Family_<Kind>.png, then quits with -ATDIconQuit */
+	UFUNCTION(Exec)
+	void ATDIconSheet(int32 Kind = 6, int32 Cell = 256, int32 Columns = 5);
 
 	/** Console helper: plays a scripted game and logs balance and performance numbers.
 	 *  Strategy 0 = unprepared (no maze), 1 = adaptive maze on the normal economy (any map), 2 = stress test from wave 25,

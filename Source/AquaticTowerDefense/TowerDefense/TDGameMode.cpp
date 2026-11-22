@@ -49,11 +49,16 @@ void ATDGameMode::BeginPlay()
 {
 	Super::BeginPlay();
 
+#if UE_BUILD_SHIPPING
+	// players never see engine debug text (profiler banners, warnings): the dev tools that start them aren't in Shipping either
+	if (GEngine)
+	{
+		GEngine->bEnableOnScreenDebugMessages = false;
+	}
+#endif
+
 	SetupEnvironment();
 	CaptureDepthBase();
-	const double PrewarmStart = FPlatformTime::Seconds();
-	TD::PrewarmModels();
-	UE_LOG(LogAquaticTowerDefense, Display, TEXT("Merged the tower, creature, shot and drop models in %.0f ms"), (FPlatformTime::Seconds() - PrewarmStart) * 1000.0);
 
 	// the board behind the main menu is already a random map
 	int32 CommandLineMap = -1;
@@ -62,6 +67,14 @@ void ATDGameMode::BeginPlay()
 		ForcedMap = CommandLineMap;
 	}
 	TD::SetMap(ForcedMap >= 0 ? ForcedMap : FMath::RandRange(0, TD::MapCount - 1));
+
+	// the board's props, seabed decor and this map's painted board on all cores at once (the tower and creature models follow in the
+	// background behind the main menu)
+	const double PrewarmStart = FPlatformTime::Seconds();
+	FTDPrewarmExtras Extras;
+	ATDGrid::AddPrewarmWork(Extras);
+	TD::PrewarmModels(Extras);
+	UE_LOG(LogAquaticTowerDefense, Display, TEXT("Merged the board's props and surface in %.0f ms"), (FPlatformTime::Seconds() - PrewarmStart) * 1000.0);
 
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -386,7 +399,15 @@ void ATDGameMode::ReleaseNextWave()
 		++BuildPhaseId;
 		Toast(TD::IsTitanWave(Wave + 1) ? FString::Printf(TEXT("Wave %d: the Abyssal Kraken rises!"), Wave + 1) : FString::Printf(TEXT("Wave %d incoming!"), Wave + 1),
 			TD::IsTitanWave(Wave + 1) ? FLinearColor(1.0f, 0.4f, 0.45f) : FLinearColor(0.6f, 1.0f, 0.95f), (TD::IsTitanWave(Wave + 1) || (Wave + 1) % 10 == 0) ? ETDToast::Important : ETDToast::Info);
-		TDAudio::Play(this, ETDSound::WaveStart, 0.8f);
+		if ((Wave + 1) % 10 != 0)
+		{
+			TDAudio::Play(this, ETDSound::WaveStart, 0.8f);
+		}
+	}
+	// a boss wave (sent early or not) announces itself with a deep horn and drum hit instead of the usual horn
+	if ((Wave + 1) % 10 == 0)
+	{
+		TDAudio::Play(this, ETDSound::BossSting, TD::IsTitanWave(Wave + 1) ? 1.0f : 0.85f);
 	}
 
 	++Wave;
@@ -680,7 +701,7 @@ void ATDGameMode::OnEnemyKilled(ATDEnemy* Enemy, ATDTower* Killer)
 	Pearls += Reward;
 	FloatingText(Enemy->GetAimLocation() + FVector(0, 0, 30), FString::Printf(TEXT("+%d"), Reward), FLinearColor(1.0f, 0.88f, 0.35f));
 	ATDFx::SpawnSplash(GetWorld(), Enemy->GetAimLocation(), TD::EnemyIconColor(Enemy->GetEnemyType()), Def.bBoss ? 2.2f : 1.0f);
-	TDAudio::Play(this, ETDSound::Kill, Def.bBoss || Enemy->IsElite() ? 1.0f : 0.6f);
+	TDAudio::PlayDeath(this, Enemy->GetEnemyType(), Def.bBoss || Enemy->IsElite() ? 1.0f : 0.6f);
 
 	// item drops: a chance above 1 gives several rolls (original rule); item level follows the wave
 	const int32 ItemLevel = Enemy->GetWave() + Def.ItemLevelBonus;
@@ -1501,6 +1522,11 @@ int32 ATDGameMode::GetCurrentWaveNumber() const
 void ATDGameMode::OpenMenu(ETDMenu NewMenu)
 {
 	Menu = NewMenu;
+	if (Menu == ETDMenu::None)
+	{
+		// the board is about to be played: the tower and creature models merged behind the menu must all be ready now
+		TD::FinishModelPrewarm();
+	}
 
 	// let the camera settle on the board for a moment before pausing behind the start menu
 	if (GetWorld()->GetTimeSeconds() < 0.3f && Menu != ETDMenu::None)
@@ -2184,11 +2210,41 @@ void ATDGameMode::SetSharpAA(bool bSharp)
 	SaveSettings();
 }
 
+void ATDGameMode::SetHDIcons(bool bOn)
+{
+	bHDIcons = bOn;
+	ApplyArtSettings();
+	SaveSettings();
+}
+
+void ATDGameMode::SetHDInterface(bool bOn)
+{
+	bHDInterface = bOn;
+	ApplyArtSettings();
+	SaveSettings();
+}
+
+void ATDGameMode::ApplyArtSettings() const
+{
+	auto SetIfDifferent = [](const TCHAR* Name, int32 Value)
+	{
+		IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name);
+		if (Var && Var->GetInt() != Value)
+		{
+			Var->Set(Value, ECVF_SetByGameSetting);
+		}
+	};
+	SetIfDifferent(TEXT("atd.DetailedIcons"), bHDIcons ? 2 : 1);
+	SetIfDifferent(TEXT("atd.DetailedUI"), bHDInterface ? 1 : 0);
+}
+
 void ATDGameMode::ApplyAntiAliasing() const
 {
 	if (IConsoleVariable* AA = IConsoleManager::Get().FindConsoleVariable(TEXT("r.AntiAliasingMethod")))
 	{
-		AA->Set(bSharpAA ? 4 : 1, ECVF_SetByGameSetting);
+		// SetByCode: the project's own r.AntiAliasingMethod (DefaultEngine.ini) outranks SetByGameSetting,
+		// which silently ignored this switch
+		AA->Set(bSharpAA ? 4 : 1, ECVF_SetByCode);
 	}
 }
 
@@ -2267,6 +2323,8 @@ void ATDGameMode::LoadSettings()
 		FrameRateStep = FMath::Clamp(Loaded->FrameRateStep, 0, TD::FrameRateStepCount - 1);
 		bShowFps = Loaded->bShowFps;
 		bVSync = Loaded->bVSync;
+		bHDIcons = Loaded->bHDIcons;
+		bHDInterface = Loaded->bHDInterface;
 		// (the saved all-ranges switch is ignored: the setting was removed, ranges show for the selection and while Alt is held)
 		SfxVolume = FMath::Clamp(Loaded->SfxVolume, 0.0f, 100.0f);
 		MusicVolume = FMath::Clamp(Loaded->MusicVolume, 0.0f, 100.0f);
@@ -2298,6 +2356,7 @@ void ATDGameMode::LoadSettings()
 	++BindingsVersion;
 	ApplyDisplaySettings();
 	ApplyAntiAliasing();
+	ApplyArtSettings();
 }
 
 void ATDGameMode::ApplyDisplaySettings()
@@ -2365,6 +2424,8 @@ void ATDGameMode::SaveSettings()
 		Save->bVSync = bVSync;
 		Save->bShowAllRanges = false;	// kept in the save format only so old settings files still load
 		Save->bSharpAA = bSharpAA;
+		Save->bHDIcons = bHDIcons;
+		Save->bHDInterface = bHDInterface;
 		Save->SfxVolume = SfxVolume;
 		Save->MusicVolume = MusicVolume;
 		Save->AutoSalvage = 0;	// kept in the save format only so old settings files still load
@@ -2788,17 +2849,6 @@ bool ATDGameMode::ToggleItemLock(int32 StorageIndex)
 	FTDItem& Item = Storage[StorageIndex];
 	Item.bLocked = !Item.bLocked;
 	return true;
-}
-
-const TCHAR* ATDGameMode::AutoSalvageName(int32 Level)
-{
-	switch (Level)
-	{
-	case 1:		return TEXT("Common");
-	case 2:		return TEXT("Common and Rare");
-	case 3:		return TEXT("Common, Rare and Epic");
-	default:	return TEXT("Off");
-	}
 }
 
 bool ATDGameMode::TryClickPickup(const FVector& WorldPoint)

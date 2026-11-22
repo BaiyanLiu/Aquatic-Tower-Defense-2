@@ -84,7 +84,6 @@ struct FTDTowerDef
 {
 	const TCHAR* Name;
 	const TCHAR* Description;
-	const TCHAR* Hotkey;
 	int32 Cost;
 	float Range;			// tiles (aura radius for support towers)
 	float Damage;
@@ -294,7 +293,8 @@ namespace TD
 	float ViewWidth();
 	constexpr float IdleLodViewWidth = 2000.0f;
 
-	/** Creature death: crawlers roll over and sink into the seabed, swimmers spiral down, over DeathSeconds */
+	/** Creature death: the killing blow squashes it, crawlers hop up and flip onto their backs, settle and sink into the seabed,
+	    swimmers roll belly-up and spiral down; both shrink a little as they go, over DeathSeconds */
 	constexpr float DeathSeconds = 0.8f;
 	struct FTDDeathPose
 	{
@@ -302,9 +302,20 @@ namespace TD
 		float Drop = 0.0f;		// share of a swimmer's height above the floor lost so far
 		float Roll = 0.0f;		// degrees onto its side / back
 		float Spin = 0.0f;		// degrees of spiral (swimmers)
+		float Hop = 0.0f;		// uu a crawler is thrown up as it flips
+		float Scale = 1.0f;		// overall size
+		float Squash = 1.0f;	// height scale (the width bulges to match); below 1 on the killing blow and the landing
+		float Limp = 0.0f;		// 0..1, how far the limbs have curled up or gone slack
 	};
 	/** Pose at Alpha (0..1 through the animation) */
 	FTDDeathPose DeathPose(float Alpha, bool bSwimming);
+
+	/** A tower's shot kick, U = 0..1 through it: snaps to 1 almost at once, then settles back with a small overshoot past rest; 0 outside */
+	float RecoilCurve(float U);
+
+	/** A new creature grows in with a little overshoot: its scale over SpawnPopSeconds of age */
+	constexpr float SpawnPopSeconds = 0.3f;
+	float SpawnPopScale(float Age);
 
 	/** Only important toasts and refusals show; routine news (wave released or sent early, common finds, the startup hint) stays quiet */
 	inline bool ShouldShowToast(ETDToast Kind) { return Kind != ETDToast::Info; }

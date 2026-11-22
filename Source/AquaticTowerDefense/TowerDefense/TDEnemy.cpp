@@ -1,4 +1,4 @@
-﻿// Aquatic Tower Defense - isometric underwater tower defense with mazing.
+// Aquatic Tower Defense - isometric underwater tower defense with mazing.
 
 #include "TDEnemy.h"
 #include "TDModels.h"
@@ -117,18 +117,21 @@ void ATDEnemy::BuildVisuals()
 		const float Diameter = ShadowSize(Type);
 		const float Opacity = IsFlying() ? 0.4f : 0.6f;
 		TArray<FTDMergedPart> Blobs;
-		for (int32 i = 0; i < 2; ++i)
+		// the detailed look stacks more, finer discs, so the shadow fades smoothly from a dark core to nothing
+		const bool bSoft = TD::UseDetailedModels();
+		const int32 BlobLayers = bSoft ? 5 : 2;
+		for (int32 i = 0; i < BlobLayers; ++i)
 		{
-			// a wide faint disc under a smaller darker one reads as a soft edge
-			const float D = Diameter * (i == 0 ? 1.0f : 0.7f);
+			// a wide faint disc under smaller darker ones reads as a soft edge
+			const float D = bSoft ? Diameter * (1.08f - 0.15f * i) : Diameter * (i == 0 ? 1.0f : 0.7f);
 			FTDMergedPart& Blob = Blobs.AddDefaulted_GetRef();
 			Blob.Shape = ETDShape::Cylinder;
 			Blob.Mat = ETDPartMaterial::Glass;
 			Blob.Location = FVector(0, 0, 1.0f + i * 0.3f);
 			Blob.Size = FVector(D, D, 0.4f);
-			Blob.Color = FLinearColor(0.0f, 0.02f, 0.03f, Opacity * (i == 0 ? 0.5f : 0.6f));
+			Blob.Color = FLinearColor(0.0f, 0.02f, 0.03f, bSoft ? Opacity * (0.18f + 0.04f * i) : Opacity * (i == 0 ? 0.5f : 0.6f));
 		}
-		TD::AddMergedMesh(this, Root, TD::GetMergedMesh(TD::MakeMergedKey(ShadowBlobKey + (uint64)Type), Blobs), false);
+		TD::AddMergedMesh(this, Root, TD::GetMergedMesh(TD::MakeMergedKey(ShadowBlobKey + (uint64)Type + (bSoft ? 64ull : 0ull)), Blobs), false);
 	}
 
 	ETDModel Model = ETDModel::Crab;
@@ -203,12 +206,32 @@ void ATDEnemy::BuildVisuals()
 			ShellPivots.Add(PivotIndex);
 		}
 	});
+	VisualScale = FVector(TD::SpawnPopScale(0.0f));
 	UpdateVisuals();
 }
 
 void ATDEnemy::UpdateVisuals()
 {
-	PivotInActor[0] = FTransform::Identity;
+	// the animation and the movement only set relative transforms, so a whole creature updates once per frame;
+	// a big hit tips the creature back and down and squashes it for a moment (the flinch), and it leans into turns
+	USceneComponent* Root = GetRootComponent();
+	FVector Location = VisualLocation;
+	FRotator Rotation = VisualRotation;
+	FVector Scale = VisualScale;
+	if (!bDying)
+	{
+		Rotation.Roll += Bank;
+		if (FlinchTime > 0.0f)
+		{
+			const float K = FMath::Sin(PI * (1.0f - FlinchTime / TD::FlinchSeconds));
+			Rotation.Pitch += 12.0f * K;
+			Location.Z -= 3.0f * K;
+			Scale *= FVector(1.0f + 0.08f * K, 1.0f + 0.08f * K, 1.0f - 0.12f * K);
+		}
+	}
+
+	// the model's scale sits on pivot 0 (the root stays at the actor's own scale), so every part and its offset follow it
+	PivotInActor[0] = FTransform(FQuat::Identity, FVector::ZeroVector, Scale);
 	for (int32 i = 1; i < PivotLocal.Num(); ++i)
 	{
 		PivotInActor[i] = PivotLocal[i] * PivotInActor[PivotParents[i]];
@@ -218,19 +241,9 @@ void ATDEnemy::UpdateVisuals()
 		const FTransform& InActor = PivotInActor[ShellPivots[i]];
 		ShellParts[i]->SetRelativeLocation_Direct(InActor.GetTranslation());
 		ShellParts[i]->SetRelativeRotation_Direct(InActor.Rotator());
+		ShellParts[i]->SetRelativeScale3D_Direct(InActor.GetScale3D());
 	}
 
-	// the animation and the movement only set relative transforms, so a whole creature updates once per frame;
-	// a big hit tips the creature back and down for a moment (the flinch)
-	USceneComponent* Root = GetRootComponent();
-	FVector Location = VisualLocation;
-	FRotator Rotation = VisualRotation;
-	if (FlinchTime > 0.0f && !bDying)
-	{
-		const float K = FMath::Sin(PI * (1.0f - FlinchTime / TD::FlinchSeconds));
-		Rotation.Pitch += 12.0f * K;
-		Location.Z -= 3.0f * K;
-	}
 	Root->SetRelativeLocation_Direct(Location);
 	Root->SetRelativeRotation_Direct(Rotation);
 	Root->UpdateComponentToWorld();
@@ -329,64 +342,123 @@ void ATDEnemy::Tick(float DeltaTime)
 		return;
 	}
 
-	// creature-specific idle animation
+	// creature-specific locomotion, on a clock that follows the creature's real pace
+	const float Pace = StunTime > 0.0f ? 0.12f : FMath::Clamp(GetCurrentSpeed() / FMath::Max(0.01f, GetDef().Speed), 0.25f, 2.5f);
+	GaitRate = FMath::FInterpTo(GaitRate, Pace, DeltaTime, 6.0f);
+	GaitTime += DeltaTime * GaitRate;
+	StunWobble = FMath::FInterpTo(StunWobble, StunTime > 0.0f ? 1.0f : 0.0f, DeltaTime, 10.0f);
+	Age += DeltaTime;
+	VisualScale = FVector(TD::SpawnPopScale(Age));
+	const float G = GaitTime;
+
+	FVector BodyOffset = FVector::ZeroVector;
+	FRotator BodyRot = FRotator::ZeroRotator;
+	FVector BodyScale = FVector::OneVector;
 	switch (Type)
 	{
 	case ETDEnemyType::Crab:
-		WalkPhase += DeltaTime * 12.0f * GetCurrentSpeed();
-		PivotLocal[BodyPivot].SetTranslation(BodyBase + FVector(0, 0, FMath::Abs(FMath::Sin(WalkPhase)) * 2.5f));
+	{
+		// crabs scuttle sideways (the body is turned 90 degrees), rocking over alternating legs; each leg lifts as it swings forward
+		const float Step = G * 14.0f;
+		BodyOffset.Z = FMath::Abs(FMath::Sin(Step)) * 2.5f;
+		BodyRot = FRotator(0, 90, FMath::Sin(Step) * 4.0f);
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
-			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(AnimTime * 14.0f + i * 1.7f) * 18.0f, 0, 0).Quaternion());
+			const float Side = PivotLocal[LimbPivots[i]].GetTranslation().Y >= 0.0f ? 1.0f : -1.0f;
+			const float Phase = Step + (((i % 4) + (Side > 0.0f ? 1 : 0)) % 2) * PI;
+			const float Lift = FMath::Max(0.0f, FMath::Cos(Phase)) * 14.0f;
+			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(Phase) * 20.0f, 0, -Side * Lift).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::Piranha:
-		PivotLocal[BodyPivot].SetTranslation(BodyBase + FVector(0, 0, FMath::Sin(AnimTime * 4.0f) * 3.0f));
+	{
+		// the tail beats and the body swings against it, so the fish swims in an S
+		const float Beat = G * 16.0f;
+		BodyOffset.Z = FMath::Sin(G * 4.0f) * 3.0f;
+		BodyRot.Yaw = FMath::Sin(Beat + PI) * 4.0f;
 		if (LimbPivots.Num() > 0)
 		{
-			PivotLocal[LimbPivots[0]].SetRotation(FRotator(0, FMath::Sin(AnimTime * 16.0f) * 25.0f, 0).Quaternion());
+			PivotLocal[LimbPivots[0]].SetRotation(FRotator(0, FMath::Sin(Beat - 0.6f) * 28.0f, 0).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::Turtle:
+	{
+		// a crawl: diagonal flippers stroke together, lifting as they reach forward, and the shell rocks and bobs with each stroke
+		const float Stroke = G * 3.0f;
+		BodyOffset.Z = FMath::Abs(FMath::Sin(Stroke)) * 1.5f;
+		BodyRot.Roll = FMath::Sin(Stroke) * 2.5f;
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
-			PivotLocal[LimbPivots[i]].SetRotation(FRotator(0, FMath::Sin(AnimTime * 3.0f + (i % 2) * PI) * 25.0f, 0).Quaternion());
+			const FVector Rest = PivotLocal[LimbPivots[i]].GetTranslation();
+			const float Side = Rest.Y >= 0.0f ? 1.0f : -1.0f;
+			const bool bDiagonal = (Rest.X >= 0.0f) == (Side > 0.0f);
+			const float Phase = Stroke + (bDiagonal ? 0.0f : PI);
+			const float Lift = FMath::Max(0.0f, FMath::Cos(Phase)) * 10.0f;
+			PivotLocal[LimbPivots[i]].SetRotation(FRotator(0, Side * FMath::Sin(Phase) * 25.0f, -Side * Lift).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::Manta:
-		PivotLocal[BodyPivot].SetTranslation(BodyBase + FVector(0, 0, FMath::Sin(AnimTime * 2.0f) * 10.0f));
+	{
+		// wings flap with the tips lagging, the body lifts on each downstroke and pitches with it
+		const float Flap = G * 4.0f;
+		BodyOffset.Z = FMath::Sin(AnimTime * 1.1f) * 7.0f - FMath::Cos(Flap) * 3.0f;
+		BodyRot.Pitch = FMath::Sin(Flap + 0.5f) * 3.0f;
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
 			const float Side = (i == 0) ? 1.0f : -1.0f;
-			PivotLocal[LimbPivots[i]].SetRotation(FRotator(0, 0, Side * FMath::Sin(AnimTime * 4.0f) * 22.0f).Quaternion());
+			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(Flap - 0.8f) * 4.0f, 0, Side * FMath::Sin(Flap) * 24.0f).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::Kraken:
-		PivotLocal[BodyPivot].SetTranslation(BodyBase + FVector(0, 0, FMath::Sin(AnimTime * 1.5f) * 5.0f));
+	{
+		// the mantle pulses like a jet (squeezes and rises, then relaxes), and a wave runs round the ring of arms
+		const float Pulse = FMath::Sin(G * 1.5f);
+		BodyOffset.Z = Pulse * 5.0f;
+		BodyScale = FVector(1.0f - 0.04f * Pulse, 1.0f - 0.04f * Pulse, 1.0f + 0.05f * Pulse);
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
-			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(AnimTime * 2.5f + i) * 12.0f, LimbYaws[i], 0).Quaternion());
+			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(G * 2.5f - i * 0.8f) * 14.0f + Pulse * 4.0f, LimbYaws[i] + FMath::Sin(G * 1.7f + i) * 6.0f, 0).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::SeaStar:
-		PivotLocal[BodyPivot].SetRotation(FRotator(0, AnimTime * 70.0f, 0).Quaternion());
+		// rolls along, wobbling on its points
+		BodyRot = FRotator(FMath::Sin(G * 3.0f) * 4.0f, G * 70.0f, FMath::Cos(G * 3.0f) * 4.0f);
+		BodyOffset.Z = FMath::Abs(FMath::Sin(G * 4.5f)) * 1.5f;
 		break;
 	case ETDEnemyType::Cuttlefish:
-		PivotLocal[BodyPivot].SetTranslation(BodyBase + FVector(0, 0, FMath::Sin(AnimTime * 3.0f) * 3.0f));
+	{
+		// the body ripples as it hovers, and the arms trail and curl in a wave
+		BodyOffset.Z = FMath::Sin(G * 3.0f) * 3.0f;
+		BodyRot.Pitch = FMath::Sin(G * 3.0f + 0.7f) * 2.0f;
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
-			PivotLocal[LimbPivots[i]].SetRotation(FRotator(0, FMath::Sin(AnimTime * 6.0f + i) * 15.0f, 0).Quaternion());
+			PivotLocal[LimbPivots[i]].SetRotation(FRotator(FMath::Sin(G * 4.0f + i * 0.7f) * 8.0f, FMath::Sin(G * 6.0f + i) * 15.0f, 0).Quaternion());
 		}
 		break;
+	}
 	case ETDEnemyType::ShockEel:
+		// a wave runs down the body, growing towards the tail
+		BodyOffset.Z = FMath::Sin(G * 2.0f) * 1.5f;
 		for (int32 i = 0; i < LimbPivots.Num(); ++i)
 		{
-			PivotLocal[LimbPivots[i]].SetTranslation(FVector(16 - i * 8.5f, FMath::Sin(AnimTime * 7.0f - i * 0.6f) * (2.0f + i * 0.9f), FMath::Sin(AnimTime * 3.0f - i * 0.4f) * 1.5f));
+			PivotLocal[LimbPivots[i]].SetTranslation(FVector(16 - i * 8.5f, FMath::Sin(G * 7.0f - i * 0.6f) * (2.0f + i * 0.9f), FMath::Sin(G * 3.0f - i * 0.4f) * 1.5f));
 		}
 		break;
 	default:
 		break;
 	}
+	if (StunWobble > 0.01f)
+	{
+		// stunned: a dizzy wobble
+		BodyRot.Yaw += FMath::Sin(AnimTime * 11.0f) * 7.0f * StunWobble;
+		BodyRot.Roll += FMath::Sin(AnimTime * 7.0f) * 5.0f * StunWobble;
+	}
+	PivotLocal[BodyPivot] = FTransform(BodyRot.Quaternion(), BodyBase + BodyOffset, BodyScale);
 
 	UpdateVisuals();
 }
@@ -438,7 +510,14 @@ void ATDEnemy::TickGround(float DeltaTime)
 	const FVector Side(-Forward.Y, Forward.X, 0.0f);
 	const FVector Desired = PathPos + Side * Lateral;
 	VisualLocation = FMath::VInterpTo(VisualLocation, Desired, DeltaTime, 10.0f);
+	const float OldYaw = VisualRotation.Yaw;
 	VisualRotation = FMath::RInterpTo(VisualRotation, Forward.Rotation(), DeltaTime, 8.0f);
+
+	// lean into the turn: swimmers bank harder than crawlers
+	const bool bSwimmer = Type == ETDEnemyType::Piranha || Type == ETDEnemyType::Cuttlefish || Type == ETDEnemyType::ShockEel;
+	const float TurnRate = DeltaTime > 0.0f ? FMath::FindDeltaAngleDegrees(OldYaw, VisualRotation.Yaw) / DeltaTime : 0.0f;
+	const float MaxBank = bSwimmer ? 20.0f : 8.0f;
+	Bank = FMath::FInterpTo(Bank, FMath::Clamp(TurnRate * (bSwimmer ? 0.09f : 0.04f), -MaxBank, MaxBank), DeltaTime, 8.0f);
 }
 
 void ATDEnemy::TickFlying(float DeltaTime)
@@ -762,7 +841,8 @@ void ATDEnemy::StartDying()
 	bFinished = true;
 	DyingTime = 0.0f;
 	DeathLocation = VisualLocation;
-	DeathRotation = VisualRotation;
+	DeathRotation = VisualRotation + FRotator(0, 0, Bank);
+	DeathBody = PivotLocal[BodyPivot];
 	FlinchTime = 0.0f;
 	if (ShieldBubble)
 	{
@@ -782,8 +862,59 @@ void ATDEnemy::TickDying(float DeltaTime)
 	DyingTime += DeltaTime;
 	const float Alpha = DyingTime / TD::DeathSeconds;
 	const TD::FTDDeathPose Pose = TD::DeathPose(Alpha, IsFlying());
-	VisualLocation = DeathLocation - FVector(0, 0, Pose.Sink + Pose.Drop * FMath::Max(0.0f, DeathLocation.Z));
-	VisualRotation = DeathRotation + FRotator(0, Pose.Spin, Pose.Roll);
+	// the whole creature spirals, hops and sinks; the kraken is tall, so it sinks further to be gone by the end
+	const float SinkScale = (Type == ETDEnemyType::Kraken ? 2.6f : 1.0f) * GetActorScale3D().Z;
+	VisualLocation = DeathLocation + FVector(0, 0, Pose.Hop - Pose.Sink * SinkScale);
+	VisualRotation = DeathRotation + FRotator(0, Pose.Spin, 0);
+	// the body rolls over about its own middle (not the ground under it), so it flips in place instead of swinging into the floor;
+	// a swimmer (the manta) also falls from the height it swims at
+	const float CenterAbovePivot = Type == ETDEnemyType::Turtle ? 16.0f : (Type == ETDEnemyType::Kraken ? 74.0f : 0.0f);
+	const FVector Center = DeathBody.GetTranslation() + FVector(0, 0, CenterAbovePivot);
+	const FQuat Roll(FVector::XAxisVector, FMath::DegreesToRadians(Pose.Roll));
+	const FVector Fall(0, 0, IsFlying() ? -Pose.Drop * BodyBase.Z : 0.0f);
+	PivotLocal[BodyPivot] = FTransform(Roll * DeathBody.GetRotation(), Center + Roll.RotateVector(DeathBody.GetTranslation() - Center) + Fall, DeathBody.GetScale3D());
+	const float Bulge = 1.0f + (1.0f - Pose.Squash) * 0.6f;
+	VisualScale = FVector(Pose.Scale * Bulge, Pose.Scale * Bulge, Pose.Scale * Pose.Squash);
+
+	// limbs: a fading twitch, while they curl up (crawlers) or go slack (swimmers)
+	const float Twitch = FMath::Exp(-DyingTime * 5.0f);
+	const float L = Pose.Limp;
+	for (int32 i = 0; i < LimbPivots.Num(); ++i)
+	{
+		FTransform& Limb = PivotLocal[LimbPivots[i]];
+		const float Jerk = FMath::Sin(DyingTime * 34.0f + i * 1.9f) * Twitch;
+		const float Side = Limb.GetTranslation().Y >= 0.0f ? 1.0f : -1.0f;
+		switch (Type)
+		{
+		case ETDEnemyType::Crab:
+		case ETDEnemyType::Turtle:
+			// legs fold in over the belly, kicking feebly
+			Limb.SetRotation(FRotator(Jerk * 16.0f, 0, Side * L * 40.0f).Quaternion());
+			break;
+		case ETDEnemyType::Piranha:
+			// a last flutter of the tail
+			Limb.SetRotation(FRotator(0, FMath::Sin(DyingTime * 30.0f) * 26.0f * Twitch, 0).Quaternion());
+			break;
+		case ETDEnemyType::Manta:
+			// wings droop and flutter
+			Limb.SetRotation(FRotator(0, 0, (i == 0 ? 1.0f : -1.0f) * (-20.0f * L + Jerk * 14.0f)).Quaternion());
+			break;
+		case ETDEnemyType::Kraken:
+			// arms curl in under the mantle
+			Limb.SetRotation(FRotator(-30.0f * L + Jerk * 8.0f, LimbYaws[i], 0).Quaternion());
+			break;
+		case ETDEnemyType::Cuttlefish:
+			// arms splay and go still
+			Limb.SetRotation(FRotator(-12.0f * L, (i - LimbPivots.Num() * 0.5f) * 4.0f * L + Jerk * 10.0f, 0).Quaternion());
+			break;
+		case ETDEnemyType::ShockEel:
+			// a spasm runs down the body and dies away, leaving it slack
+			Limb.SetTranslation(FVector(16 - i * 8.5f, FMath::Sin(DyingTime * 22.0f - i * 0.9f) * (2.0f + i * 1.2f) * Twitch, 0.0f));
+			break;
+		default:
+			break;
+		}
+	}
 	UpdateVisuals();
 	if (Alpha >= 1.0f)
 	{
@@ -889,6 +1020,7 @@ void ATDEnemy::DealDamage(float Amount, ATDTower* Source, float XpScale)
 	if (GameMode && TD::CrossesSplitThreshold(OldHealth, Health, SplitHealth, SplitsLeft))
 	{
 		GameMode->SpawnSplit(this);
+		TDAudio::Play(this, ETDSound::Split, 0.7f);
 	}
 
 	if (Health <= 0.0f)

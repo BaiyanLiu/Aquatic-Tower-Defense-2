@@ -205,6 +205,14 @@ void ATDHUD::DrawMapThumbnail(int32 Map, const FBox2D& Rect, float Alpha)
 {
 	const float Cell = FMath::Min(Rect.GetSize().X / TD::Cols, Rect.GetSize().Y / TD::Rows);
 	const FVector2D Origin = Rect.GetCenter() - FVector2D(Cell * TD::Cols, Cell * TD::Rows) * 0.5f;
+	if (IsDetailedUI())
+	{
+		if (UTexture2D* Painted = MapThumbnailTexture(Map))
+		{
+			DrawTexture(Painted, Origin.X, Origin.Y, Cell * TD::Cols, Cell * TD::Rows, 0.0f, 0.0f, 1.0f, 1.0f, FLinearColor(1.0f, 1.0f, 1.0f, Alpha), BLEND_Translucent);
+			return;
+		}
+	}
 	const FLinearColor Tint = TD::MapTint(Map);
 	const FLinearColor Sand = FLinearColor(0.14f * Tint.R, 0.25f * Tint.G, 0.28f * Tint.B, Alpha);
 	const FLinearColor Sand2 = FLinearColor(0.17f * Tint.R, 0.29f * Tint.G, 0.31f * Tint.B, Alpha);

@@ -226,9 +226,17 @@ public:
 	void SetWallLinks(uint8 Mask);
 	uint8 GetWallLinks() const { return WallLinks; }
 
+	/** Builds the meshes the first tower of a game would otherwise build on the spot: this map's platform now, and the sculpted Coral Walls
+	 *  for every straight link pattern in the background (sculpting one takes 100-500 ms) */
+	static void PrewarmBoardMeshes();
+
 protected:
 
 	void BuildVisuals();
+
+	/** Shows the wall mesh for WallLinks. A sculpted wall not merged yet is sculpted in the background; meanwhile the wall keeps the mesh it
+	 *  shows, or a new one borrows the nearest finished pattern. */
+	void ShowWallMesh();
 
 	/** Builds the creature (or harpoon gun) on top of the platform: the base model, or its form's model once a form is chosen */
 	void BuildTowerModel();
@@ -347,8 +355,12 @@ protected:
 	/** Trident of the Deep King: the extra strikes on the 2 nearest other creatures in range */
 	void TridentStrike(ATDEnemy* Target);
 
-	/** Idle loops ease towards a smaller sway while the tower is firing */
+	/** Idle loops ease towards a smaller sway while the tower has a target */
 	float IdleBlend = 1.0f;
+	/** Whether last tick found a target: idle eases down and the next shot winds up while engaged */
+	bool bEngaged = false;
+	/** Acid vent smoke clock, which runs faster for a moment on each aura pulse */
+	float PuffClock = 0.0f;
 	int32 ShownPips = 0;
 
 	/** Parts that sway on their own: jelly tentacles, shrimp eyes, fins, flippers and tube worms */

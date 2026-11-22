@@ -147,6 +147,12 @@ private:
 	int32 Spawned = 0;
 	bool bShotTaken = false;
 	bool bCsvRunning = false;
+	/** Moving census: primitive transforms (and render state rebuilds) seen on one frame, compared on the next */
+	TMap<TWeakObjectPtr<class UPrimitiveComponent>, FTransform> CensusTransforms;
+	int32 CensusStep = 0;
+	/** -ATDCompare="<console command>": paused side by side shots of the heavy wave before and after the command */
+	int32 CompareStep = 0;
+	float CompareTime = 0.0f;
 	TArray<float> FrameTimes;
 	double Frames = 0.0, FrameMs = 0.0, GameMs = 0.0, RenderMs = 0.0, GpuMs = 0.0, DrawCalls = 0.0, Primitives = 0.0, WorstMs = 0.0;
 };
@@ -166,6 +172,7 @@ private:
 	int32 PairsPerPage = 8;
 	int32 First = 0;
 	int32 Last = 0;
+	TArray<int32> Ids;
 	int32 Next = 0;
 	int32 Page = 0;
 	int32 Phase = 0;

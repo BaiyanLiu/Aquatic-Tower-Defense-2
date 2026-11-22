@@ -33,6 +33,10 @@ namespace
 	/** Round stone platform every tower stands on */
 	constexpr float PlinthHeight = 34.0f;
 
+	/** Towers face the bottom left of the screen until they turn to aim: the camera looks along yaw 45, so screen down-left is world -Y.
+	 *  The whole model (ModelBase) is turned, so the turret's own yaw stays relative to it. */
+	constexpr float TowerFacingYaw = -90.0f;
+
 	// merged mesh keys
 	constexpr uint64 PlatformKey = 1;
 	constexpr uint64 PipsKeyBase = 10;
@@ -40,6 +44,10 @@ namespace
 	constexpr uint64 MasteryKeyBase = 9100;		// + mastery rank (1-4)
 	constexpr uint64 WallKeyBase = 10000;	// clear of the other merged keys: there are 256 link masks
 	constexpr uint64 DetailedWallKeyBase = 20000;	// the walls with the detailed shapes (atd.DetailedModels)
+	constexpr uint64 SculptedWallKeyBase = 30000;	// the detailed walls with their rocks melted into one sculpted reef (atd.SculptedModels)
+	constexpr uint64 DetailedPipsKeyBase = 9200;	// the pips set in bezels (atd.DetailedModels)
+	constexpr uint64 DetailedFormBadgeKeyBase = 9300;
+	constexpr uint64 DetailedMasteryKeyBase = 9400;
 	constexpr int32 WallVariants = 4;
 
 	static_assert((int32)ETDModel::AcidVentBlack - (int32)ETDModel::HarpoonSwordfish + 1 == ((int32)ETDTowerType::AcidVent - (int32)ETDTowerType::Harpoon + 1) * TD::FormsPerTower,
@@ -230,7 +238,18 @@ namespace
 			}
 		}
 
+		// everything so far is stone (the platform's layers, the blocks and the flagstones)
+		auto MarkFrom = [&Platform](int32 First, ETDSurface Surface)
+		{
+			for (int32 i = First; i < Platform.Num(); ++i)
+			{
+				Platform[i].Surface = Surface;
+			}
+		};
+		MarkFrom(0, ETDSurface::Stone);
+
 		// moss creeping over the rim and down the side
+		const int32 FirstMoss = Platform.Num();
 		const FLinearColor Moss = Style.Moss, MossDark = Style.MossDark;
 		for (int32 i = 0; i < 4; ++i)
 		{
@@ -241,7 +260,10 @@ namespace
 			Add(ETDShape::Sphere, FVector(FMath::Cos(A + 0.08f) * 47.0f, FMath::Sin(A + 0.08f) * 47.0f, PlinthHeight - 12.0f), FVector(2.6f, 6.0f, 6.0f), Color, FMath::RadiansToDegrees(A));
 		}
 
+		MarkFrom(FirstMoss, ETDSurface::Moss);
+
 		// pebbles and a little sand at the foot
+		const int32 FirstPebble = Platform.Num();
 		for (int32 i = 0; i < 14; ++i)
 		{
 			const float A = Rand.FRand() * 2.0f * PI;
@@ -251,6 +273,47 @@ namespace
 				Tone(Style.Stone, 0.75f, 1.25f), Rand.FRand() * 180.0f);
 		}
 
+		MarkFrom(FirstPebble, ETDSurface::Stone);
+
+		// the higher-detail touches: a skirt of sand with shells and tufts of sea grass at the foot, and dark mortar lines between the courses
+		{
+			const int32 FirstSand = Platform.Num();
+			Add(ETDShape::Cylinder, FVector(0.0f, 0.0f, 0.6f), FVector(99.0f, 99.0f, 1.2f), FLinearColor(0.55f, 0.47f, 0.33f) * Shade);
+			MarkFrom(FirstSand, ETDSurface::Sand);
+			const int32 FirstMortar = Platform.Num();
+			const FLinearColor Mortar(Style.Stone.R * 0.45f, Style.Stone.G * 0.45f, Style.Stone.B * 0.45f, 1.0f);
+			Add(ETDShape::Cylinder, FVector(0.0f, 0.0f, 17.2f), FVector(90.6f, 90.6f, 0.9f), Mortar);
+			Add(ETDShape::Cylinder, FVector(0.0f, 0.0f, 4.2f), FVector(90.6f, 90.6f, 0.9f), Mortar);
+			MarkFrom(FirstMortar, ETDSurface::Stone);
+			const int32 FirstShell = Platform.Num();
+			for (int32 i = 0; i < 6; ++i)
+			{
+				const float A = Rand.FRand() * 2.0f * PI;
+				const float R = Rand.FRandRange(47.5f, 49.0f);
+				Add(ETDShape::Sphere, FVector(FMath::Cos(A) * R, FMath::Sin(A) * R, 1.4f), FVector(4.0f, 3.6f, 1.6f), FLinearColor(0.95f, 0.8f, 0.7f) * Shade, FMath::RadiansToDegrees(A));
+			}
+			MarkFrom(FirstShell, ETDSurface::Shell);
+			const int32 FirstGrass = Platform.Num();
+			for (int32 t = 0; t < 4; ++t)
+			{
+				const float A = Rand.FRand() * 2.0f * PI;
+				for (int32 k = 0; k < 5; ++k)
+				{
+					const float Lean = (k - 2) * 12.0f;
+					const float Height = Rand.FRandRange(8.0f, 14.0f);
+					const FQuat Q = FQuat(FVector::UpVector, A) * FQuat(FVector::ForwardVector, FMath::DegreesToRadians(Lean));
+					FTDMergedPart& Blade = Platform.AddDefaulted_GetRef();
+					Blade.Shape = ETDShape::Cone;
+					Blade.Location = FVector(FMath::Cos(A) * 47.5f, FMath::Sin(A) * 47.5f, 0.0f) + Q.RotateVector(FVector(0.0f, 0.0f, Height * 0.5f));
+					Blade.Size = FVector(1.6f, 0.6f, Height);
+					Blade.Rotation = Q;
+					Blade.Color = FLinearColor(0.18f, 0.42f, 0.2f) * Shade;
+				}
+			}
+			MarkFrom(FirstGrass, ETDSurface::Skin);
+		}
+
+		const int32 FirstMapTouch = Platform.Num();
 		if (Style.Map == 2)
 		{
 			// coral crust: little knobs of pink, orange and violet coral over the side and rim
@@ -264,6 +327,7 @@ namespace
 				const float Size = Rand.FRandRange(3.0f, 5.5f);
 				Add(ETDShape::Sphere, FVector(FMath::Cos(A) * R, FMath::Sin(A) * R, Z), FVector(Size, Size, Size * 0.8f), Corals[i % 4] * Shade, FMath::RadiansToDegrees(A));
 			}
+			MarkFrom(FirstMapTouch, ETDSurface::Coral);
 		}
 		else if (Style.Map == 3)
 		{
@@ -274,11 +338,13 @@ namespace
 				const float A = 2.0f * PI * i / Tiles;
 				Add(ETDShape::Cube, FVector(FMath::Cos(A) * 31.0f, FMath::Sin(A) * 31.0f, PlinthHeight + 1.25f), FVector(5.0f, 9.0f, 0.9f),
 					(i % 2 ? FLinearColor(0.2f, 0.55f, 0.55f) : FLinearColor(0.78f, 0.62f, 0.3f)) * Shade, FMath::RadiansToDegrees(A));
+				Platform.Last().Surface = i % 2 ? ETDSurface::Plain : ETDSurface::Brass;
 			}
 			for (int32 i = 0; i < 24; ++i)
 			{
 				const float A = 2.0f * PI * i / 24;
 				Add(ETDShape::Cube, FVector(FMath::Cos(A) * 25.5f, FMath::Sin(A) * 25.5f, PlinthHeight + 1.25f), FVector(1.4f, 7.0f, 0.8f), FLinearColor(0.78f, 0.62f, 0.3f) * Shade, FMath::RadiansToDegrees(A));
+				Platform.Last().Surface = ETDSurface::Brass;
 			}
 		}
 		else if (Style.Map == 1)
@@ -288,6 +354,7 @@ namespace
 			{
 				const float A = Rand.FRand() * 2.0f * PI;
 				Add(ETDShape::Sphere, FVector(FMath::Cos(A) * 45.8f, FMath::Sin(A) * 45.8f, Rand.FRandRange(6.0f, PlinthHeight - 4.0f)), FVector(1.6f, 1.6f, 1.6f), FLinearColor(0.55f, 0.6f, 0.65f) * Shade);
+				Platform.Last().Surface = ETDSurface::Metal;
 			}
 		}
 
@@ -295,6 +362,37 @@ namespace
 		{
 			Part.bDetailed = true;
 		}
+	}
+}
+
+namespace
+{
+	/** The round stone platform every tower stands on: each map has its own stone, a little darker per Abyss tier; one cached mesh per map and tier */
+	const FTDMergedMesh& PlatformMesh()
+	{
+		TArray<FTDMergedPart> Platform;
+		auto Layer = [&Platform](float Z, float Diameter, float Height, const FLinearColor& Color)
+		{
+			FTDMergedPart& Part = Platform.AddDefaulted_GetRef();
+			Part.Shape = ETDShape::Cylinder;
+			Part.Location = FVector(0, 0, Z);
+			Part.Size = FVector(Diameter, Diameter, Height);
+			Part.Color = Color;
+		};
+		const int32 Map = FMath::Clamp(TD::GetMap(), 0, TD::MapCount - 1);
+		const int32 Tier = FMath::Clamp(TD::Run().Tier, 0, TD::MaxAbyssTier);
+		const FPlatformStyle Style = PlatformStyle(Map, Tier);
+		const float Shade = 1.0f - 0.15f * TD::AbyssDepth(Tier);
+		Layer(2.0f, 94.0f, 4.0f, Style.Stone);
+		Layer((PlinthHeight - 3.0f) * 0.5f, 90.0f, PlinthHeight - 3.0f, Style.Stone);
+		Layer(PlinthHeight - 2.0f, 93.0f, 4.0f, Style.Top);
+		const uint64 StyleBits = ((uint64)(Map + 1) << 42) | ((uint64)Tier << 46);
+		if (TD::UseDetailedModels())
+		{
+			AddPlatformTexture(Platform, Style, Shade);
+			return TD::GetMergedMesh(TD::MakeMergedKey(PlatformKey | (1ull << 41) | StyleBits), Platform);
+		}
+		return TD::GetMergedMesh(TD::MakeMergedKey(PlatformKey | StyleBits), Platform);
 	}
 }
 
@@ -314,33 +412,7 @@ void ATDTower::BuildVisuals()
 	default:
 	{
 		// every tower stands on a round stone platform, and its model sits on top
-		TArray<FTDMergedPart> Platform;
-		auto Layer = [&Platform](float Z, float Diameter, float Height, const FLinearColor& Color)
-		{
-			FTDMergedPart& Part = Platform.AddDefaulted_GetRef();
-			Part.Shape = ETDShape::Cylinder;
-			Part.Location = FVector(0, 0, Z);
-			Part.Size = FVector(Diameter, Diameter, Height);
-			Part.Color = Color;
-		};
-		// each map has its own stone, a little darker per Abyss tier; one cached mesh per map and tier
-		const int32 Map = FMath::Clamp(TD::GetMap(), 0, TD::MapCount - 1);
-		const int32 Tier = FMath::Clamp(TD::Run().Tier, 0, TD::MaxAbyssTier);
-		const FPlatformStyle Style = PlatformStyle(Map, Tier);
-		const float Shade = 1.0f - 0.15f * TD::AbyssDepth(Tier);
-		Layer(2.0f, 94.0f, 4.0f, Style.Stone);
-		Layer((PlinthHeight - 3.0f) * 0.5f, 90.0f, PlinthHeight - 3.0f, Style.Stone);
-		Layer(PlinthHeight - 2.0f, 93.0f, 4.0f, Style.Top);
-		const uint64 StyleBits = ((uint64)(Map + 1) << 42) | ((uint64)Tier << 46);
-		if (TD::UseDetailedModels())
-		{
-			AddPlatformTexture(Platform, Style, Shade);
-			TD::AddMergedMesh(this, Root, TD::GetMergedMesh(TD::MakeMergedKey(PlatformKey | (1ull << 41) | StyleBits), Platform), !G, GhostRecolor(G));
-		}
-		else
-		{
-			TD::AddMergedMesh(this, Root, TD::GetMergedMesh(TD::MakeMergedKey(PlatformKey | StyleBits), Platform), !G, GhostRecolor(G));
-		}
+		TD::AddMergedMesh(this, Root, PlatformMesh(), !G, GhostRecolor(G));
 		BuildTowerModel();
 		break;
 	}
@@ -351,6 +423,7 @@ void ATDTower::BuildTowerModel()
 {
 	const bool G = bGhost;
 	ModelBase = TD::AddPivot(this, GetRootComponent(), FVector(0, 0, PlinthHeight));
+	ModelBase->SetRelativeRotation(FRotator(0.0f, TowerFacingYaw, 0.0f));
 	ModelForm = G ? 0 : Form;
 	FTDModelOptions Options;
 	Options.MinSize = 2.5f;
@@ -379,6 +452,29 @@ void ATDTower::BuildTowerModel()
 	{
 		Puffs.Add(Puff);
 		PuffBases.Add(Puff->GetRelativeLocation());
+	}
+	if (Type == ETDTowerType::AcidVent && Puffs.Num() > 0 && TD::UseDetailedModels() && !bGhost)
+	{
+		// the vent's plume reads as smoke, not solid balls: soft see-through puffs in the form's own colour
+		// (acid yellow-green, the Cold Seep's pale shimmer, the Black Smoker's sooty grey)
+		const FLinearColor SmokeColor = ModelForm == 1 ? FLinearColor(0.72f, 0.86f, 0.9f) : (ModelForm == 2 ? FLinearColor(0.16f, 0.15f, 0.17f) : FLinearColor(0.62f, 0.78f, 0.36f));
+		UMaterialInterface* Smoke = TD::SharedFxMaterial(SmokeColor, ModelForm == 2 ? 0.6f : 0.42f);
+		for (USceneComponent* Puff : Puffs)
+		{
+			TArray<USceneComponent*> PuffMeshes;
+			Puff->GetChildrenComponents(true, PuffMeshes);
+			for (USceneComponent* Child : PuffMeshes)
+			{
+				if (UStaticMeshComponent* Mesh = Cast<UStaticMeshComponent>(Child))
+				{
+					for (int32 Slot = 0; Slot < Mesh->GetNumMaterials(); ++Slot)
+					{
+						Mesh->SetMaterial(Slot, Smoke);
+					}
+					Mesh->SetCastShadow(false);
+				}
+			}
+		}
 	}
 
 	if (Type == ETDTowerType::Eel && !bGhost && AnimPivot)
@@ -436,6 +532,226 @@ void ATDTower::RebuildTowerModel()
 	BuildTowerModel();
 }
 
+namespace
+{
+	/** A few looks per link pattern, so every wall on the board shares one of a small set of meshes (the ghost's cell is negative) */
+	int32 WallVariant(const FIntPoint& Cell)
+	{
+		return FMath::Abs(Cell.X * 3 + Cell.Y * 7) % WallVariants;
+	}
+
+	uint64 WallMeshKey(uint8 Mask, int32 Variant, bool bDetailed, bool bSculpted)
+	{
+		return TD::MakeMergedKey((bSculpted ? SculptedWallKeyBase : (bDetailed ? DetailedWallKeyBase : WallKeyBase)) + Mask * WallVariants + Variant);
+	}
+
+	/** The parts of a Coral Wall for one link pattern and look */
+	void BuildWallParts(uint8 Mask, int32 Variant, bool bDetailed, bool bSculpted, TArray<FTDMergedPart>& Parts)
+	{
+		// what the next shapes are made of in the detailed models
+		ETDSurface NextSurface = ETDSurface::Auto;
+		auto Shape = [&Parts, &NextSurface](ETDShape S, const FVector& Loc, const FVector& Size, const FLinearColor& Color, const FRotator& Rot = FRotator::ZeroRotator)
+		{
+			FTDMergedPart& Part = Parts.AddDefaulted_GetRef();
+			Part.Surface = NextSurface;
+			Part.Shape = S;
+			Part.Location = Loc;
+			Part.Size = Size;
+			Part.Color = Color;
+			Part.Rotation = Rot.Quaternion();
+		};
+
+		// grid column is world +Y, grid row is world -X
+		const FVector Dirs[] = { FVector(0, 1, 0), FVector(0, -1, 0), FVector(-1, 0, 0), FVector(1, 0, 0) };
+		// same order as the diagonal link bits: next column + next row, next column + previous row, and so on
+		const FVector DiagonalDirs[] = { FVector(-1, 1, 0), FVector(1, 1, 0), FVector(-1, -1, 0), FVector(1, -1, 0) };
+
+		// rounded reef rock on the seabed with a brain-coral cap, moss, barnacles and tube sponges, plus a ridge and coral towards each linked wall
+		// and a lower ridge towards each diagonal one
+		const FVector B = FVector::ZeroVector;
+		const FLinearColor RockColors[] = { FLinearColor(0.3f, 0.25f, 0.24f), FLinearColor(0.4f, 0.32f, 0.28f), FLinearColor(0.26f, 0.23f, 0.25f), FLinearColor(0.35f, 0.3f, 0.3f) };
+		const FLinearColor Moss(0.2f, 0.45f, 0.22f);
+		FRandomStream Rand(Variant * 131 + (Mask & 0x0F) * 17);	// a diagonal neighbor adds its ridge without re-rolling the rest of the rock
+		auto Dir =[](const FVector& V) { return FRotationMatrix::MakeFromZ(V.GetSafeNormal()).Rotator(); };
+		auto Tube = [&Shape, &Dir](const FVector& A, const FVector& C, float Diameter, const FLinearColor& Color)
+		{
+			Shape(ETDShape::Cylinder, (A + C) * 0.5f, FVector(Diameter, Diameter, FVector::Dist(A, C)), Color, Dir(C - A));
+		};
+		auto Barnacle = [&Shape, &Dir, &NextSurface](const FVector& P, float S, const FVector& D)
+		{
+			const ETDSurface Was = NextSurface;
+			NextSurface = ETDSurface::Shell;
+			Shape(ETDShape::Cone, P, FVector(S, S, S * 0.8f), FLinearColor(0.86f, 0.84f, 0.76f), Dir(D));
+			NextSurface = ETDSurface::Plain;
+			Shape(ETDShape::Sphere, P + D * S * 0.35f, FVector(S * 0.35f, S * 0.35f, S * 0.2f), FLinearColor(0.25f, 0.22f, 0.2f), Dir(D));
+			NextSurface = Was;
+		};
+
+		const float Rocks[4][7] = { { 0, 0, 16, 60, 58, 32, 0 }, { 3, -3, 40, 50, 48, 26, 1 }, { -14, 12, 10, 28, 26, 20, 2 }, { 16, 14, 8, 24, 22, 16, 3 } };
+		NextSurface = ETDSurface::Stone;
+		for (const float* R : Rocks)
+		{
+			Shape(ETDShape::Sphere, B + FVector(R[0], R[1], R[2]), FVector(R[3], R[4], R[5]), RockColors[(int32)R[6]], FRotator(0, Rand.FRand() * 90.0f, 0));
+		}
+		NextSurface = ETDSurface::Brain;
+		Shape(ETDShape::Sphere, B + FVector(0, 0, 60), FVector(44, 44, 30), FLinearColor::FromSRGBColor(FColor(0xFF, 0x7C, 0x80)));
+		for (int32 g = 0; g < 4; ++g)
+		{
+			Shape(ETDShape::Sphere, B + FVector(0, 0, 60 + g * 3.5f), FVector(45 - g * 7, 45 - g * 7, 10), FLinearColor::FromSRGBColor(FColor(0xE0, 0x55, 0x6A)));
+		}
+		NextSurface = ETDSurface::Coral;
+		for (int32 i = 0; i < 10; ++i)
+		{
+			const float A = 0.3f + i / 10.0f * 2.0f * PI;
+			Shape(ETDShape::Sphere, B + FVector(FMath::Cos(A) * 17, FMath::Sin(A) * 17, 66), FVector(6, 6, 5), FLinearColor::FromSRGBColor(FColor(0xFF, 0x9A, 0xA0)));
+		}
+		NextSurface = ETDSurface::Moss;
+		for (int32 i = 0; i < 5; ++i)
+		{
+			const float A = Rand.FRand() * 2.0f * PI;
+			const float Z = 30 + Rand.FRand() * 10;
+			Shape(ETDShape::Sphere, B + FVector(FMath::Cos(A) * 22, FMath::Sin(A) * 20, Z), FVector(16, 14, 5), Moss, Dir(FVector(FMath::Cos(A) * 0.6f, FMath::Sin(A) * 0.6f, 1)));
+		}
+		for (int32 i = 0; i < 8; ++i)
+		{
+			const float A = Rand.FRand() * 2.0f * PI;
+			const float Z = 12 + Rand.FRand() * 24;
+			const float S = 6 + Rand.FRand() * 3;
+			Barnacle(B + FVector(FMath::Cos(A) * 28, FMath::Sin(A) * 27, Z), S, FVector(FMath::Cos(A), FMath::Sin(A), 0.4f));
+		}
+		{
+			const float A = Rand.FRand() * 2.0f * PI;
+			for (int32 k = 0; k < 3; ++k)
+			{
+				const float X = FMath::Cos(A) * 18 + k * 6, Y = FMath::Sin(A) * 18 - k * 4, H = 18.0f + k * 6;
+				NextSurface = ETDSurface::Coral;
+				Shape(ETDShape::Cylinder, B + FVector(X, Y, 44 + H * 0.5f), FVector(8, 8, H), FLinearColor(1.0f, 0.55f, 0.2f));
+				NextSurface = ETDSurface::Plain;
+				Shape(ETDShape::Cylinder, B + FVector(X, Y, 44 + H + 0.5f), FVector(5, 5, 2), FLinearColor(0.4f, 0.15f, 0.05f));
+			}
+		}
+
+		for (int32 d = 0; d < 4; ++d)
+		{
+			if (!(Mask & (1 << d)))
+			{
+				continue;
+			}
+			const float DX = Dirs[d].X, DY = Dirs[d].Y;
+			const bool bAlongX = FMath::Abs(DX) > 0.5f;
+			NextSurface = ETDSurface::Stone;
+			const float Ridge[4][6] = { { 30, 16, 40, 32, 2, 0 }, { 46, 17, 34, 30, 0, 6 }, { 38, 40, 32, 24, 1, -4 }, { 50, 36, 22, 18, 3, 3 } };
+			for (const float* R : Ridge)
+			{
+				Shape(ETDShape::Sphere, B + FVector(DX * R[0] + DY * R[5], DY * R[0] + DX * R[5], R[1]), bAlongX ? FVector(R[2], 46, R[3]) : FVector(46, R[2], R[3]), RockColors[(int32)R[4]]);
+			}
+			for (int32 i = 0; i < 4; ++i)
+			{
+				const float R = 28 + Rand.FRand() * 22;
+				const float Z = 14 + Rand.FRand() * 20;
+				const float S = 5 + Rand.FRand() * 2;
+				Barnacle(B + FVector(DX * R + DY * 22, DY * R + DX * 22, Z), S, FVector(DY, DX, 0.3f));
+			}
+			NextSurface = ETDSurface::Moss;
+			Shape(ETDShape::Sphere, B + FVector(DX * 40, DY * 40, 50), FVector(20, 18, 5), Moss);
+			NextSurface = ETDSurface::Coral;
+
+			const float Kind = Rand.FRand();
+			const float BX = 34 + Rand.FRand() * 10;
+			const float BY = 34 + Rand.FRand() * 10;
+			const FVector Base = B + FVector(DX * BX, DY * BY, 50);
+			if (Kind < 0.4f)
+			{
+				// sea fan: radiating twigs in one plane
+				for (int32 k = 0; k < 7; ++k)
+				{
+					const float T = (k / 6.0f - 0.5f) * 1.6f, H = 22 + FMath::Cos(T) * 8;
+					const FVector TipPos = Base + FVector(DY * FMath::Sin(T) * H, DX * FMath::Sin(T) * H, FMath::Cos(T) * H);
+					Tube(Base, TipPos, 2.4f, FLinearColor(0.85f, 0.22f, 0.6f));
+					Shape(ETDShape::Sphere, TipPos, FVector(4, 4, 4), FLinearColor(1.0f, 0.4f, 0.75f));
+				}
+			}
+			else if (Kind < 0.75f)
+			{
+				// staghorn with sub-branches
+				const FLinearColor Col(1.0f, 0.55f, 0.2f), TipCol(1.0f, 0.72f, 0.4f);
+				for (int32 k = 0; k < 3; ++k)
+				{
+					const float Pitch = (Rand.FRand() - 0.5f) * 50;
+					const float Yaw = Rand.FRand() * 360;
+					const float Roll = (Rand.FRand() - 0.5f) * 40;
+					const FVector Up = FRotator(Pitch, Yaw, Roll).RotateVector(FVector::UpVector);
+					const float H = 18 + Rand.FRand() * 12;
+					const FVector TipPos = Base + Up * H;
+					Tube(Base, TipPos, 5, Col);
+					Shape(ETDShape::Sphere, TipPos, FVector(7, 7, 7), TipCol);
+					const FVector Mid = Base + Up * H * 0.5f;
+					const float TX = (Rand.FRand() - 0.5f) * 14;
+					const float TY = (Rand.FRand() - 0.5f) * 14;
+					const FVector Twig = Mid + FVector(TX, TY, 8);
+					Tube(Mid, Twig, 3.5f, Col);
+					Shape(ETDShape::Sphere, Twig, FVector(5, 5, 5), TipCol);
+				}
+			}
+			else
+			{
+				// anemone
+				NextSurface = ETDSurface::Skin;
+				Shape(ETDShape::Cylinder, Base + FVector(0, 0, 5), FVector(12, 12, 10), FLinearColor(0.55f, 0.2f, 0.55f));
+				for (int32 k = 0; k < 12; ++k)
+				{
+					const float A = k / 12.0f * 2.0f * PI;
+					Shape(ETDShape::Cone, Base + FVector(FMath::Cos(A) * 6, FMath::Sin(A) * 6, 15), FVector(3, 3, 12), FLinearColor(0.95f, 0.5f, 0.9f), Dir(FVector(FMath::Cos(A) * 0.5f, FMath::Sin(A) * 0.5f, 1)));
+				}
+			}
+		}
+
+		for (int32 d = 0; d < 4; ++d)
+		{
+			if (!(Mask & (16 << d)))
+			{
+				continue;
+			}
+			// each wall draws its half of the ridge, out to the shared tile corner about 71 units away.
+			// It stays narrow enough to miss the platforms on the other two tiles at that corner.
+			const FVector Out = DiagonalDirs[d].GetSafeNormal();
+			const FVector Side(-Out.Y, Out.X, 0);
+			const FRotator Along(0, Out.Rotation().Yaw, 0);
+			NextSurface = ETDSurface::Stone;
+			const float Ridge[5][7] = { { 32, 15, 46, 30, 2, 0 }, { 52, 14, 42, 28, 0, 3 }, { 66, 13, 28, 26, 3, -2 }, { 40, 35, 34, 22, 1, 0 }, { 58, 32, 28, 18, 3, 1 } };
+			for (const float* R : Ridge)
+			{
+				Shape(ETDShape::Sphere, B + Out * R[0] + Side * R[5] + FVector(0, 0, R[1]), FVector(R[2], 34, R[3]), RockColors[(int32)R[4]], Along);
+			}
+			NextSurface = ETDSurface::Moss;
+			Shape(ETDShape::Sphere, B + Out * 48 + FVector(0, 0, 45), FVector(20, 14, 4), Moss, Along);
+			for (int32 i = 0; i < 2; ++i)
+			{
+				const float SideSign = i == 0 ? 1.0f : -1.0f;
+				Barnacle(B + Out * (36 + Rand.FRand() * 24) + Side * SideSign * 14 + FVector(0, 0, 14 + Rand.FRand() * 14), 5 + Rand.FRand() * 2, Side * SideSign + FVector(0, 0, 0.3f));
+			}
+		}
+
+		// the detailed look: rounded, smoother shapes plus speckled rock, pale barnacle and anemone tips
+		if (bDetailed)
+		{
+			TDModelDetail::AddDetail(Mask * WallVariants + Variant, 0.0f, Parts);
+		}
+		if (bSculpted)
+		{
+			// the rocks melt into one another and into the coral, so the wall reads as one grown reef, not a pile of balls
+			for (FTDMergedPart& Part : Parts)
+			{
+				if (Part.Mat == ETDPartMaterial::Lit && Part.Shape != ETDShape::Plane && Part.Size.GetMin() >= 3.0f
+					&& (Part.Surface == ETDSurface::Stone || Part.Surface == ETDSurface::Moss || Part.Surface == ETDSurface::Coral))
+				{
+					Part.bSculpt = true;
+				}
+			}
+		}
+	}
+}
+
 void ATDTower::SetWallLinks(uint8 Mask)
 {
 	if (Type != ETDTowerType::Wall || Mask == WallLinks)
@@ -443,193 +759,96 @@ void ATDTower::SetWallLinks(uint8 Mask)
 		return;
 	}
 	WallLinks = Mask;
+	ShowWallMesh();
+}
 
+void ATDTower::ShowWallMesh()
+{
+	const uint8 Mask = WallLinks;
+	const int32 Variant = WallVariant(Cell);
+	const bool bDetailed = TD::UseDetailedModels();
+	const bool bSculpted = bDetailed && TD::UseSculptedModels();
+	const uint64 Key = WallMeshKey(Mask, Variant, bDetailed, bSculpted);
+	const FTDMergedMesh* Merged = TD::FindMergedMesh(Key);
+	if (!Merged && bSculpted)
+	{
+		// melting the rocks into one reef takes 100-500 ms, far too long for a click: it's sculpted on a worker thread, and the wall
+		// shows its real mesh when that lands
+		TArray<FTDMergedPart> Parts;
+		BuildWallParts(Mask, Variant, bDetailed, bSculpted, Parts);
+		TD::RequestMergedMeshAsync(Key, MoveTemp(Parts), [WeakThis = TWeakObjectPtr<ATDTower>(this), Mask]()
+		{
+			ATDTower* Tower = WeakThis.Get();
+			if (Tower && Tower->WallLinks == Mask)
+			{
+				Tower->ShowWallMesh();
+			}
+		});
+		// meanwhile it borrows a finished pattern: its straight links in its own look (the same rocks without the diagonal ridges, always
+		// there once the prewarm is done), then these links in another look, then the straight ones in another
+		const uint8 Straight = Mask & 0x0F;
+		Merged = TD::FindMergedMesh(WallMeshKey(Straight, Variant, bDetailed, bSculpted));
+		for (int32 v = 1; v < WallVariants && !Merged; ++v)
+		{
+			Merged = TD::FindMergedMesh(WallMeshKey(Mask, (Variant + v) % WallVariants, bDetailed, bSculpted));
+		}
+		for (int32 v = 1; v < WallVariants && !Merged; ++v)
+		{
+			Merged = TD::FindMergedMesh(WallMeshKey(Straight, (Variant + v) % WallVariants, bDetailed, bSculpted));
+		}
+		if (!Merged && WallParts.Num() > 0)
+		{
+			return;	// the prewarm is still running: keep the old pattern until the real one lands
+		}
+		if (!Merged)
+		{
+			// nothing sculpted yet (the prewarm is still running): the unsculpted detailed rocks, which merge in a few milliseconds
+			TArray<FTDMergedPart> Plain;
+			BuildWallParts(Mask, Variant, bDetailed, false, Plain);
+			Merged = &TD::GetMergedMesh(WallMeshKey(Mask, Variant, bDetailed, false), Plain);
+		}
+	}
+	if (!Merged)
+	{
+		TArray<FTDMergedPart> Parts;
+		BuildWallParts(Mask, Variant, bDetailed, bSculpted, Parts);
+		Merged = &TD::GetMergedMesh(Key, Parts);
+	}
+
+	if (WallParts.Num() == 1 && WallParts[0] && WallParts[0]->GetStaticMesh() == Merged->Mesh)
+	{
+		return;	// already showing it (a borrowed pattern that stays the same)
+	}
 	for (UStaticMeshComponent* Part : WallParts)
 	{
 		TD::DestroyMergedMesh(Part);
 	}
 	WallParts.Reset();
+	if (Merged->Mesh)
+	{
+		WallParts.Add(TD::AddMergedMesh(this, GetRootComponent(), *Merged, !bGhost, GhostRecolor(bGhost)));
+	}
+}
 
-	USceneComponent* Root = GetRootComponent();
-	const bool G = bGhost;
-	TArray<FTDMergedPart> Parts;
-	auto Shape = [&Parts](ETDShape S, const FVector& Loc, const FVector& Size, const FLinearColor& Color, const FRotator& Rot = FRotator::ZeroRotator)
+void ATDTower::PrewarmBoardMeshes()
+{
+	TD::PrewarmShadowMesh(PlatformMesh());
+	if (!TD::UseDetailedModels() || !TD::UseSculptedModels())
 	{
-		FTDMergedPart& Part = Parts.AddDefaulted_GetRef();
-		Part.Shape = S;
-		Part.Location = Loc;
-		Part.Size = Size;
-		Part.Color = Color;
-		Part.Rotation = Rot.Quaternion();
-	};
-
-	// grid column is world +Y, grid row is world -X
-	const FVector Dirs[] = { FVector(0, 1, 0), FVector(0, -1, 0), FVector(-1, 0, 0), FVector(1, 0, 0) };
-	// same order as the diagonal link bits: next column + next row, next column + previous row, and so on
-	const FVector DiagonalDirs[] = { FVector(-1, 1, 0), FVector(1, 1, 0), FVector(-1, -1, 0), FVector(1, -1, 0) };
-
-	// rounded reef rock on the seabed with a brain-coral cap, moss, barnacles and tube sponges, plus a ridge and coral towards each linked wall
-	// and a lower ridge towards each diagonal one
-	const FVector B = FVector::ZeroVector;
-	const FLinearColor RockColors[] = { FLinearColor(0.3f, 0.25f, 0.24f), FLinearColor(0.4f, 0.32f, 0.28f), FLinearColor(0.26f, 0.23f, 0.25f), FLinearColor(0.35f, 0.3f, 0.3f) };
-	const FLinearColor Moss(0.2f, 0.45f, 0.22f);
-	// a few looks per link pattern, so every wall on the board shares one of a small set of meshes
-	const int32 Variant = FMath::Abs(Cell.X * 3 + Cell.Y * 7) % WallVariants;	// the ghost's cell is negative
-	FRandomStream Rand(Variant * 131 + (Mask & 0x0F) * 17);	// a diagonal neighbor adds its ridge without re-rolling the rest of the rock
-	auto Dir =[](const FVector& V) { return FRotationMatrix::MakeFromZ(V.GetSafeNormal()).Rotator(); };
-	auto Tube = [&Shape, &Dir](const FVector& A, const FVector& C, float Diameter, const FLinearColor& Color)
-	{
-		Shape(ETDShape::Cylinder, (A + C) * 0.5f, FVector(Diameter, Diameter, FVector::Dist(A, C)), Color, Dir(C - A));
-	};
-	auto Barnacle = [&Shape, &Dir](const FVector& P, float S, const FVector& D)
-	{
-		Shape(ETDShape::Cone, P, FVector(S, S, S * 0.8f), FLinearColor(0.86f, 0.84f, 0.76f), Dir(D));
-		Shape(ETDShape::Sphere, P + D * S * 0.35f, FVector(S * 0.35f, S * 0.35f, S * 0.2f), FLinearColor(0.25f, 0.22f, 0.2f), Dir(D));
-	};
-
-	const float Rocks[4][7] = { { 0, 0, 16, 60, 58, 32, 0 }, { 3, -3, 40, 50, 48, 26, 1 }, { -14, 12, 10, 28, 26, 20, 2 }, { 16, 14, 8, 24, 22, 16, 3 } };
-	for (const float* R : Rocks)
-	{
-		Shape(ETDShape::Sphere, B + FVector(R[0], R[1], R[2]), FVector(R[3], R[4], R[5]), RockColors[(int32)R[6]], FRotator(0, Rand.FRand() * 90.0f, 0));
+		return;
 	}
-	Shape(ETDShape::Sphere, B + FVector(0, 0, 60), FVector(44, 44, 30), FLinearColor::FromSRGBColor(FColor(0xFF, 0x7C, 0x80)));
-	for (int32 g = 0; g < 4; ++g)
+	for (int32 Straight = 0; Straight < 16; ++Straight)
 	{
-		Shape(ETDShape::Sphere, B + FVector(0, 0, 60 + g * 3.5f), FVector(45 - g * 7, 45 - g * 7, 10), FLinearColor::FromSRGBColor(FColor(0xE0, 0x55, 0x6A)));
-	}
-	for (int32 i = 0; i < 10; ++i)
-	{
-		const float A = 0.3f + i / 10.0f * 2.0f * PI;
-		Shape(ETDShape::Sphere, B + FVector(FMath::Cos(A) * 17, FMath::Sin(A) * 17, 66), FVector(6, 6, 5), FLinearColor::FromSRGBColor(FColor(0xFF, 0x9A, 0xA0)));
-	}
-	for (int32 i = 0; i < 5; ++i)
-	{
-		const float A = Rand.FRand() * 2.0f * PI;
-		const float Z = 30 + Rand.FRand() * 10;
-		Shape(ETDShape::Sphere, B + FVector(FMath::Cos(A) * 22, FMath::Sin(A) * 20, Z), FVector(16, 14, 5), Moss, Dir(FVector(FMath::Cos(A) * 0.6f, FMath::Sin(A) * 0.6f, 1)));
-	}
-	for (int32 i = 0; i < 8; ++i)
-	{
-		const float A = Rand.FRand() * 2.0f * PI;
-		const float Z = 12 + Rand.FRand() * 24;
-		const float S = 6 + Rand.FRand() * 3;
-		Barnacle(B + FVector(FMath::Cos(A) * 28, FMath::Sin(A) * 27, Z), S, FVector(FMath::Cos(A), FMath::Sin(A), 0.4f));
-	}
-	{
-		const float A = Rand.FRand() * 2.0f * PI;
-		for (int32 k = 0; k < 3; ++k)
+		for (int32 Variant = 0; Variant < WallVariants; ++Variant)
 		{
-			const float X = FMath::Cos(A) * 18 + k * 6, Y = FMath::Sin(A) * 18 - k * 4, H = 18.0f + k * 6;
-			Shape(ETDShape::Cylinder, B + FVector(X, Y, 44 + H * 0.5f), FVector(8, 8, H), FLinearColor(1.0f, 0.55f, 0.2f));
-			Shape(ETDShape::Cylinder, B + FVector(X, Y, 44 + H + 0.5f), FVector(5, 5, 2), FLinearColor(0.4f, 0.15f, 0.05f));
-		}
-	}
-
-	for (int32 d = 0; d < 4; ++d)
-	{
-		if (!(Mask & (1 << d)))
-		{
-			continue;
-		}
-		const float DX = Dirs[d].X, DY = Dirs[d].Y;
-		const bool bAlongX = FMath::Abs(DX) > 0.5f;
-		const float Ridge[4][6] = { { 30, 16, 40, 32, 2, 0 }, { 46, 17, 34, 30, 0, 6 }, { 38, 40, 32, 24, 1, -4 }, { 50, 36, 22, 18, 3, 3 } };
-		for (const float* R : Ridge)
-		{
-			Shape(ETDShape::Sphere, B + FVector(DX * R[0] + DY * R[5], DY * R[0] + DX * R[5], R[1]), bAlongX ? FVector(R[2], 46, R[3]) : FVector(46, R[2], R[3]), RockColors[(int32)R[4]]);
-		}
-		for (int32 i = 0; i < 4; ++i)
-		{
-			const float R = 28 + Rand.FRand() * 22;
-			const float Z = 14 + Rand.FRand() * 20;
-			const float S = 5 + Rand.FRand() * 2;
-			Barnacle(B + FVector(DX * R + DY * 22, DY * R + DX * 22, Z), S, FVector(DY, DX, 0.3f));
-		}
-		Shape(ETDShape::Sphere, B + FVector(DX * 40, DY * 40, 50), FVector(20, 18, 5), Moss);
-
-		const float Kind = Rand.FRand();
-		const float BX = 34 + Rand.FRand() * 10;
-		const float BY = 34 + Rand.FRand() * 10;
-		const FVector Base = B + FVector(DX * BX, DY * BY, 50);
-		if (Kind < 0.4f)
-		{
-			// sea fan: radiating twigs in one plane
-			for (int32 k = 0; k < 7; ++k)
+			const uint64 Key = WallMeshKey((uint8)Straight, Variant, true, true);
+			if (!TD::FindMergedMesh(Key))
 			{
-				const float T = (k / 6.0f - 0.5f) * 1.6f, H = 22 + FMath::Cos(T) * 8;
-				const FVector TipPos = Base + FVector(DY * FMath::Sin(T) * H, DX * FMath::Sin(T) * H, FMath::Cos(T) * H);
-				Tube(Base, TipPos, 2.4f, FLinearColor(0.85f, 0.22f, 0.6f));
-				Shape(ETDShape::Sphere, TipPos, FVector(4, 4, 4), FLinearColor(1.0f, 0.4f, 0.75f));
+				TArray<FTDMergedPart> Parts;
+				BuildWallParts((uint8)Straight, Variant, true, true, Parts);
+				TD::RequestMergedMeshAsync(Key, MoveTemp(Parts));
 			}
 		}
-		else if (Kind < 0.75f)
-		{
-			// staghorn with sub-branches
-			const FLinearColor Col(1.0f, 0.55f, 0.2f), TipCol(1.0f, 0.72f, 0.4f);
-			for (int32 k = 0; k < 3; ++k)
-			{
-				const float Pitch = (Rand.FRand() - 0.5f) * 50;
-				const float Yaw = Rand.FRand() * 360;
-				const float Roll = (Rand.FRand() - 0.5f) * 40;
-				const FVector Up = FRotator(Pitch, Yaw, Roll).RotateVector(FVector::UpVector);
-				const float H = 18 + Rand.FRand() * 12;
-				const FVector TipPos = Base + Up * H;
-				Tube(Base, TipPos, 5, Col);
-				Shape(ETDShape::Sphere, TipPos, FVector(7, 7, 7), TipCol);
-				const FVector Mid = Base + Up * H * 0.5f;
-				const float TX = (Rand.FRand() - 0.5f) * 14;
-				const float TY = (Rand.FRand() - 0.5f) * 14;
-				const FVector Twig = Mid + FVector(TX, TY, 8);
-				Tube(Mid, Twig, 3.5f, Col);
-				Shape(ETDShape::Sphere, Twig, FVector(5, 5, 5), TipCol);
-			}
-		}
-		else
-		{
-			// anemone
-			Shape(ETDShape::Cylinder, Base + FVector(0, 0, 5), FVector(12, 12, 10), FLinearColor(0.55f, 0.2f, 0.55f));
-			for (int32 k = 0; k < 12; ++k)
-			{
-				const float A = k / 12.0f * 2.0f * PI;
-				Shape(ETDShape::Cone, Base + FVector(FMath::Cos(A) * 6, FMath::Sin(A) * 6, 15), FVector(3, 3, 12), FLinearColor(0.95f, 0.5f, 0.9f), Dir(FVector(FMath::Cos(A) * 0.5f, FMath::Sin(A) * 0.5f, 1)));
-			}
-		}
-	}
-
-	for (int32 d = 0; d < 4; ++d)
-	{
-		if (!(Mask & (16 << d)))
-		{
-			continue;
-		}
-		// each wall draws its half of the ridge, out to the shared tile corner about 71 units away.
-		// It stays narrow enough to miss the platforms on the other two tiles at that corner.
-		const FVector Out = DiagonalDirs[d].GetSafeNormal();
-		const FVector Side(-Out.Y, Out.X, 0);
-		const FRotator Along(0, Out.Rotation().Yaw, 0);
-		const float Ridge[5][7] = { { 32, 15, 46, 30, 2, 0 }, { 52, 14, 42, 28, 0, 3 }, { 66, 13, 28, 26, 3, -2 }, { 40, 35, 34, 22, 1, 0 }, { 58, 32, 28, 18, 3, 1 } };
-		for (const float* R : Ridge)
-		{
-			Shape(ETDShape::Sphere, B + Out * R[0] + Side * R[5] + FVector(0, 0, R[1]), FVector(R[2], 34, R[3]), RockColors[(int32)R[4]], Along);
-		}
-		Shape(ETDShape::Sphere, B + Out * 48 + FVector(0, 0, 45), FVector(20, 14, 4), Moss, Along);
-		for (int32 i = 0; i < 2; ++i)
-		{
-			const float SideSign = i == 0 ? 1.0f : -1.0f;
-			Barnacle(B + Out * (36 + Rand.FRand() * 24) + Side * SideSign * 14 + FVector(0, 0, 14 + Rand.FRand() * 14), 5 + Rand.FRand() * 2, Side * SideSign + FVector(0, 0, 0.3f));
-		}
-	}
-
-	// the detailed look: rounded, smoother shapes plus speckled rock, pale barnacle and anemone tips
-	const bool bDetailed = TD::UseDetailedModels();
-	if (bDetailed)
-	{
-		TDModelDetail::AddDetail(Mask * WallVariants + Variant, 0.0f, Parts);
-	}
-	const FTDMergedMesh& Merged = TD::GetMergedMesh(TD::MakeMergedKey((bDetailed ? DetailedWallKeyBase : WallKeyBase) + Mask * WallVariants + Variant), Parts);
-	if (Merged.Mesh)
-	{
-		WallParts.Add(TD::AddMergedMesh(this, Root, Merged, !G, GhostRecolor(G)));
 	}
 }
 
@@ -654,7 +873,38 @@ void ATDTower::UpdateLevelPips()
 		Pip.Size = FVector(9, 9, 9);
 		Pip.Color = FLinearColor(1.0f, 0.8f, 0.25f);
 	}
-	const FTDMergedMesh& Merged = TD::GetDetailedMergedMesh(PipsKeyBase + Tiers, Parts);
+	const bool bJewel = TD::UseDetailedModels();
+	if (bJewel)
+	{
+		// each pip a polished gold pearl seated in a dark bezel ringed with tiny beads
+		const int32 Count = Parts.Num();
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const FVector At = Parts[i].Location;
+			Parts[i].Size = FVector(8.5f, 8.5f, 7.5f);
+			Parts[i].Surface = ETDSurface::Brass;
+			FTDMergedPart& Bezel = Parts.AddDefaulted_GetRef();
+			Bezel.Shape = ETDShape::Cylinder;
+			Bezel.Location = At - FVector(0, 0, 2.0f);
+			Bezel.Size = FVector(12.0f, 12.0f, 3.0f);
+			Bezel.Color = FLinearColor(0.12f, 0.1f, 0.08f);
+			Bezel.Surface = ETDSurface::Metal;
+			for (int32 b = 0; b < 8; ++b)
+			{
+				FTDMergedPart& Bead = Parts.AddDefaulted_GetRef();
+				Bead.Shape = ETDShape::Sphere;
+				Bead.Location = At + FRotator(0, 45.0f * b, 0).RotateVector(FVector(6.2f, 0, -0.8f));
+				Bead.Size = FVector(2.0f, 2.0f, 2.0f);
+				Bead.Color = FLinearColor(0.9f, 0.7f, 0.3f);
+				Bead.Surface = ETDSurface::Brass;
+			}
+		}
+	}
+	for (FTDMergedPart& Part : Parts)
+	{
+		Part.bDetailed = bJewel;
+	}
+	const FTDMergedMesh& Merged = bJewel ? TD::GetMergedMesh(TD::MakeMergedKey(DetailedPipsKeyBase + Tiers), Parts) : TD::GetDetailedMergedMesh(PipsKeyBase + Tiers, Parts);
 	if (LevelPips)
 	{
 		LevelPips->SetStaticMesh(Merged.Mesh);
@@ -1149,8 +1399,53 @@ void ATDTower::UpdateFormBadge()
 	Gem.Location = FVector(-40.0f, 0.0f, PlinthHeight + 8.0f);
 	Gem.Size = FVector(11.0f, 11.0f, 17.0f);
 	Gem.Color = Color;
+	const bool bJewel = TD::UseDetailedModels();
+	if (bJewel)
+	{
+		// the gem cut into facets and held in a gold setting with four prongs; gold studs along the glowing band
+		const FVector GemAt = Gem.Location;
+		for (int32 f = 0; f < 6; ++f)
+		{
+			FTDMergedPart& Facet = Parts.AddDefaulted_GetRef();
+			Facet.Shape = ETDShape::Cube;
+			Facet.Mat = ETDPartMaterial::Glow;
+			Facet.Location = GemAt + FRotator(0, 60.0f * f, 0).RotateVector(FVector(3.2f, 0, 0));
+			Facet.Rotation = FRotator(0, 60.0f * f, 0).Quaternion();
+			Facet.Size = FVector(1.2f, 5.5f, 13.0f);
+			Facet.Color = FMath::Lerp(Color, FLinearColor::White, 0.35f);
+		}
+		FTDMergedPart& Cup = Parts.AddDefaulted_GetRef();
+		Cup.Shape = ETDShape::Cylinder;
+		Cup.Location = GemAt - FVector(0, 0, 8.0f);
+		Cup.Size = FVector(13.0f, 13.0f, 4.0f);
+		Cup.Color = FLinearColor(0.85f, 0.65f, 0.28f);
+		Cup.Surface = ETDSurface::Brass;
+		for (int32 k = 0; k < 4; ++k)
+		{
+			FTDMergedPart& Prong = Parts.AddDefaulted_GetRef();
+			Prong.Shape = ETDShape::Cylinder;
+			Prong.Location = GemAt + FRotator(0, 45.0f + 90.0f * k, 0).RotateVector(FVector(5.2f, 0, -3.0f));
+			Prong.Rotation = (FRotator(0, 45.0f + 90.0f * k, 0).Quaternion() * FRotator(-14.0f, 0, 0).Quaternion());
+			Prong.Size = FVector(1.6f, 1.6f, 9.0f);
+			Prong.Color = FLinearColor(0.9f, 0.72f, 0.32f);
+			Prong.Surface = ETDSurface::Brass;
+		}
+		for (int32 k = 0; k < 16; ++k)
+		{
+			FTDMergedPart& Stud = Parts.AddDefaulted_GetRef();
+			Stud.Shape = ETDShape::Sphere;
+			Stud.Location = FRotator(0, 22.5f * k + 11.25f, 0).RotateVector(FVector(46.5f, 0, PlinthHeight - 9.0f));
+			Stud.Size = FVector(3.0f, 3.0f, 3.0f);
+			Stud.Color = FLinearColor(0.9f, 0.72f, 0.32f);
+			Stud.Surface = ETDSurface::Brass;
+		}
+	}
 
-	const FTDMergedMesh& Merged = TD::GetDetailedMergedMesh(FormBadgeKeyBase + Form, Parts);
+	for (FTDMergedPart& Part : Parts)
+	{
+		Part.bDetailed = bJewel;
+	}
+	const FTDMergedMesh& Merged = bJewel ? TD::GetMergedMesh(TD::MakeMergedKey(DetailedFormBadgeKeyBase + Form), Parts) : TD::GetDetailedMergedMesh(FormBadgeKeyBase + Form, Parts);
 	if (FormBadge)
 	{
 		FormBadge->SetStaticMesh(Merged.Mesh);
@@ -1215,7 +1510,33 @@ void ATDTower::UpdateMasteryTrim()
 		}
 	}
 
-	const FTDMergedMesh& Merged = TD::GetDetailedMergedMesh(MasteryKeyBase + Rank, Parts);
+	const bool bJewel = TD::UseDetailedModels();
+	if (bJewel)
+	{
+		// worked metal: the bands read as metal, and a row of small beads runs round the top of the upper band
+		for (FTDMergedPart& Part : Parts)
+		{
+			if (Part.Mat == ETDPartMaterial::Lit && Part.Color.R > 0.1f)
+			{
+				Part.Surface = ETDSurface::Brass;
+			}
+		}
+		const float BeadZ = Rank >= 2 ? 17.5f : 8.8f;
+		for (int32 k = 0; k < 32; ++k)
+		{
+			FTDMergedPart& Bead = Parts.AddDefaulted_GetRef();
+			Bead.Shape = ETDShape::Sphere;
+			Bead.Mat = Mat;
+			Bead.Location = FRotator(0, 11.25f * k, 0).RotateVector(FVector(Rank >= 2 ? 49.2f : 50.2f, 0, BeadZ));
+			Bead.Size = FVector(2.4f, 2.4f, 2.4f);
+			Bead.Color = Color;
+			if (Mat == ETDPartMaterial::Lit)
+			{
+				Bead.Surface = ETDSurface::Brass;
+			}
+		}
+	}
+	const FTDMergedMesh& Merged = bJewel ? TD::GetDetailedMergedMesh(DetailedMasteryKeyBase + Rank, Parts) : TD::GetDetailedMergedMesh(MasteryKeyBase + Rank, Parts);
 	if (MasteryTrim)
 	{
 		MasteryTrim->SetStaticMesh(Merged.Mesh);
@@ -1455,85 +1776,144 @@ void ATDTower::Tick(float DeltaTime)
 	AnimTime += DeltaTime;
 	FireKick = FMath::Max(0.0f, FireKick - DeltaTime * 3.0f);
 
-	// idle life: eased down while the tower is firing, and still when the camera is
-	// zoomed far out (where the models drop to their lowest detail). Nothing here turns the tower's facing.
-	const bool bBusy = FireKick > 0.0f;
-	IdleBlend = FMath::FInterpTo(IdleBlend, bBusy ? 0.35f : 1.0f, DeltaTime, 4.0f);
-	const float IdleAmp = TD::ViewWidth() > TD::IdleLodViewWidth ? 0.0f : IdleBlend;
+	// the target first: the wind-up and the turret's aim below both follow it
+	const bool bAttacks = !bGhost && IsAttackTower();
+	ATDEnemy* Target = bAttacks ? FindTarget(HitsFlying()) : nullptr;
+	if (bAttacks)
+	{
+		bEngaged = Target != nullptr;
+	}
+
+	// idle life: eased down while the tower has a target, and still when the camera is
+	// zoomed far out (where the models drop to their lowest detail). Only the aim turns the tower's facing, never the idle motion.
+	IdleBlend = FMath::FInterpTo(IdleBlend, bEngaged ? 0.35f : 1.0f, DeltaTime, 4.0f);
+	const bool bIdleLod = TD::ViewWidth() > TD::IdleLodViewWidth;
+	const float IdleAmp = bIdleLod ? 0.0f : IdleBlend;
 	auto IdleSin = [IdleAmp](float X) { return IdleAmp * FMath::Sin(X); };
 	auto IdleCos = [IdleAmp](float X) { return IdleAmp * FMath::Cos(X); };
 
-	// idle animation
+	// the shot: a kick that lands at once and settles back through a small overshoot
+	const float Kick = TD::RecoilCurve(1.0f - FireKick);
+	// the wind-up just before a shot while a target is held (a fast tower barely winds up at all)
+	float Windup = 0.0f;
+	if (bEngaged && !bGhost)
+	{
+		const float WindupTime = FMath::Min(0.2f, 0.45f / FMath::Max(0.01f, GetRate()));
+		Windup = FMath::Square(FMath::Clamp(1.0f - Cooldown / WindupTime, 0.0f, 1.0f));
+	}
+	// support towers swell for a moment with each aura pulse
+	const float SincePulse = AuraPulseInterval - PulseCooldown;
+	const float Swell = (bIdleLod || bGhost || !IsSupportTower() || SincePulse >= 0.6f) ? 0.0f : FMath::Sin(PI * FMath::Max(0.0f, SincePulse) / 0.6f);
+
+	// idle animation. The pivot's new location, rotation and scale are gathered here and set once below:
+	// each separate set would move every part under the pivot again
 	if (AnimPivot)
 	{
+		FVector PivotLocation = AnimPivot->GetRelativeLocation();
+		FRotator PivotRotation = AnimPivot->GetRelativeRotation();
+		FVector PivotScale = AnimPivot->GetRelativeScale3D();
 		switch (Type)
 		{
 		case ETDTowerType::Jelly:
 		{
-			AnimPivot->SetRelativeLocation(AnimBase + FVector(0, 0, IdleSin(AnimTime * 2.2f) * 6.0f));
-			const float Squash = 1.0f + FireKick * 0.25f;
-			AnimPivot->SetRelativeScale3D(FVector(Squash, Squash, 1.0f / Squash));
+			// the bell swims: it contracts and rises, relaxes and drifts down; it stretches tall before a pulse and splays on it
+			const float Swim = IdleSin(AnimTime * 2.2f);
+			PivotLocation = AnimBase + FVector(0, 0, Swim * 6.0f + Windup * 5.0f);
+			const float Wide = 1.0f + Kick * 0.25f - FMath::Max(0.0f, Swim) * 0.06f - Windup * 0.08f;
+			PivotScale = FVector(Wide, Wide, 1.0f / Wide);
 			for (int32 i = 0; i < Tentacles.Num(); ++i)
 			{
-				Tentacles[i]->SetRelativeRotation(FRotator(IdleSin(AnimTime * 2.6f + i) * 10.0f, 0, IdleCos(AnimTime * 2.2f + i * 1.3f) * 8.0f));
+				// tentacles trail the bell's stroke and flare out on a pulse
+				Tentacles[i]->SetRelativeRotation(FRotator(IdleSin(AnimTime * 2.2f - 0.9f + i) * 10.0f + Kick * 9.0f, 0, IdleCos(AnimTime * 2.2f + i * 1.3f) * 8.0f));
 			}
 			break;
 		}
 		case ETDTowerType::Puffer:
 		case ETDTowerType::Lionfish:
 		{
-			const float Puff = 1.0f + FireKick * (Type == ETDTowerType::Puffer ? 0.4f : 0.15f) + IdleSin(AnimTime * 1.6f) * 0.03f;
-			AnimPivot->SetRelativeScale3D(FVector(Puff));
+			// a breath in before the shot, then the puff
+			const bool bPuffer = Type == ETDTowerType::Puffer;
+			const float Puff = 1.0f + Kick * (bPuffer ? 0.4f : 0.15f) - Windup * (bPuffer ? 0.07f : 0.03f) + IdleSin(AnimTime * 1.6f) * 0.03f;
+			PivotScale = FVector(Puff);
 			break;
 		}
 		case ETDTowerType::Eel:
 		{
-			AnimPivot->SetRelativeRotation(FRotator(IdleSin(AnimTime * 1.7f) * 4.0f, AnimPivot->GetRelativeRotation().Yaw, IdleCos(AnimTime * 1.3f) * 4.0f));
+			PivotRotation = FRotator(IdleSin(AnimTime * 1.7f) * 4.0f, PivotRotation.Yaw, IdleCos(AnimTime * 1.3f) * 4.0f);
 			if (Light)
 			{
-				Light->SetIntensity(2000.0f + FireKick * 12000.0f + IdleSin(AnimTime * 9.0f) * 300.0f);
+				// the glow charges up before a zap and flares on it
+				Light->SetIntensity(FMath::Max(0.0f, 2000.0f + Kick * 12000.0f + Windup * 5000.0f + IdleSin(AnimTime * 9.0f) * 300.0f));
 			}
 			break;
 		}
 		case ETDTowerType::Humpback:
 		{
-			// bob, turn, and swell with an aura beat every second and a half
-			AnimPivot->SetRelativeLocation(AnimBase + FVector(0, 0, IdleSin(AnimTime * 2.0f) * 4.0f));
-			AnimPivot->SetRelativeRotation(FRotator(0, AnimTime * 25.0f, 0));
-			const float Beat = FMath::Pow(FMath::Max(0.0f, IdleSin(AnimTime * PI / 1.5f)), 12.0f);
-			AnimPivot->SetRelativeScale3D(FVector(1.0f + 0.04f * Beat));
+			// bob, turn, and swell with each aura pulse
+			PivotLocation = AnimBase + FVector(0, 0, IdleSin(AnimTime * 2.0f) * 4.0f + Swell * 3.0f);
+			PivotRotation = FRotator(0, FRotator::NormalizeAxis(AnimTime * 25.0f), 0);
+			PivotScale = FVector(1.0f + 0.05f * Swell);
 			break;
 		}
 		default:
 			break;
 		}
 
-		// turrets kick back along their aim when they fire and breathe gently while idle
+		// turrets kick back along their aim when they fire, lean into a wind-up just before, and breathe gently while idle
 		const bool bTurret = Type == ETDTowerType::Harpoon || Type == ETDTowerType::Mantis || Type == ETDTowerType::Octopus
 			|| Type == ETDTowerType::Sawfish || Type == ETDTowerType::Puffer || Type == ETDTowerType::Lionfish || Type == ETDTowerType::Eel;
 		if (bTurret)
 		{
-			const FRotator Rot = AnimPivot->GetRelativeRotation();
+			const FRotator Rot = PivotRotation;
 			const FVector Back = -FRotator(0, Rot.Yaw, 0).Vector();
-			const float Kick = FireKick * FireKick;
-			// the mantis shrimp lunges into its punch instead of recoiling
-			const float KickBack = Type == ETDTowerType::Mantis ? -5.0f : (Type == ETDTowerType::Puffer ? 4.0f : (Type == ETDTowerType::Octopus ? 1.5f : 9.0f));
-			AnimPivot->SetRelativeLocation(AnimBase + Back * KickBack * Kick + FVector(0, 0, IdleSin(AnimTime * 1.8f) * 1.5f));
+			// the mantis shrimp crouches back, then lunges into its punch instead of recoiling
+			float KickBack = 9.0f;
+			float WindBack = 0.0f;
+			switch (Type)
+			{
+			case ETDTowerType::Mantis:	KickBack = -5.0f; WindBack = 3.0f; break;
+			case ETDTowerType::Puffer:	KickBack = 4.0f; break;
+			case ETDTowerType::Octopus:	KickBack = 1.5f; WindBack = 1.0f; break;
+			case ETDTowerType::Sawfish:	WindBack = 2.0f; break;
+			case ETDTowerType::Eel:		WindBack = 2.0f; break;
+			default:					break;
+			}
+			PivotLocation = AnimBase + Back * (KickBack * Kick + WindBack * Windup) + FVector(0, 0, IdleSin(AnimTime * 1.8f) * 1.5f);
 			if (Type == ETDTowerType::Harpoon)
 			{
-				// a slow nod of the launcher while it waits
-				AnimPivot->SetRelativeRotation(FRotator(Kick * 10.0f + IdleSin(AnimTime * 0.9f) * 1.5f, Rot.Yaw, 0));
+				// a slow nod of the launcher while it waits, a jolt up on the shot
+				PivotRotation = FRotator(Kick * 10.0f + IdleSin(AnimTime * 0.9f) * 1.5f, Rot.Yaw, 0);
 			}
 			if (Type == ETDTowerType::Mantis)
 			{
 				// a slight side-to-side sway on its legs
-				AnimPivot->SetRelativeRotation(FRotator(0, Rot.Yaw, IdleSin(AnimTime * 1.1f) * 3.0f));
+				PivotRotation = FRotator(0, Rot.Yaw, IdleSin(AnimTime * 1.1f) * 3.0f);
 			}
 			if (Type == ETDTowerType::Eel)
 			{
-				// the eel lunges as it zaps
-				AnimPivot->SetRelativeScale3D(FVector(1.0f, 1.0f, 1.0f + 0.18f * Kick));
+				// the eel coils before it zaps and lunges as it does
+				PivotScale = FVector(1.0f, 1.0f, 1.0f + 0.18f * Kick - 0.08f * Windup);
 			}
+		}
+
+		// turn the turret / head towards the target: eases into the aim instead of stopping dead, never faster than 540 degrees a second
+		if (Target && Type != ETDTowerType::Jelly)
+		{
+			const FVector ToTarget = Target->GetActorLocation() - GetActorLocation();
+			const float DesiredYaw = ToTarget.Rotation().Yaw - TowerFacingYaw;	// the turret turns within the model, which already faces TowerFacingYaw
+			const float Delta = FMath::FindDeltaAngleDegrees(PivotRotation.Yaw, DesiredYaw);
+			const float MaxStep = 540.0f * DeltaTime;
+			PivotRotation.Yaw = FRotator::NormalizeAxis(PivotRotation.Yaw + FMath::Clamp(Delta * FMath::Min(1.0f, 16.0f * DeltaTime), -MaxStep, MaxStep));
+		}
+
+		// one transform update for the pivot and everything under it, and none when nothing moved (zoomed out, idle)
+		if (!PivotLocation.Equals(AnimPivot->GetRelativeLocation(), 0.0f) || !PivotRotation.Equals(AnimPivot->GetRelativeRotation(), 0.0f)
+			|| !PivotScale.Equals(AnimPivot->GetRelativeScale3D(), 0.0f))
+		{
+			AnimPivot->SetRelativeLocation_Direct(PivotLocation);
+			AnimPivot->SetRelativeRotation_Direct(PivotRotation);
+			AnimPivot->SetRelativeScale3D_Direct(PivotScale);
+			AnimPivot->UpdateComponentToWorld();
 		}
 	}
 	if (Spinner)
@@ -1545,20 +1925,23 @@ void ATDTower::Tick(float DeltaTime)
 	{
 		if (Type == ETDTowerType::Humpback)
 		{
-			// a whale's fluke beats up and down
-			Tail->SetRelativeRotation(FQuat(FVector::YAxisVector, -0.6f + IdleSin(AnimTime * 1.4f) * 0.22f));
+			// a whale's fluke beats up and down, harder on a pulse
+			Tail->SetRelativeRotation(FQuat(FVector::YAxisVector, -0.6f + IdleSin(AnimTime * 1.4f) * 0.22f - Swell * 0.15f));
 		}
 		else
 		{
-			Tail->SetRelativeRotation(FRotator(0, IdleSin(AnimTime * 4.0f) * 20.0f, 0));
+			// fish tails wag, and flick on a shot
+			Tail->SetRelativeRotation(FRotator(0, IdleSin(AnimTime * 4.0f) * 20.0f + Kick * 14.0f, 0));
 		}
 	}
 	for (int32 i = 0; i < Throwers.Num(); ++i)
 	{
-		// cocked behind the head, whipped forward on its throw and eased back
-		ThrowKicks[i] = FMath::Max(0.0f, ThrowKicks[i] - DeltaTime * 5.0f);
+		// whipped forward on its throw and eased back; the next arm to throw cocks behind the head first
+		ThrowKicks[i] = FMath::Max(0.0f, ThrowKicks[i] - DeltaTime * 4.0f);
+		const float Throw = ThrowKicks[i] > 0.0f ? TD::RecoilCurve(1.0f - ThrowKicks[i]) : 0.0f;
+		const float Cock = i == NextThrower ? Windup * 0.4f : 0.0f;
 		// arms curl a little between throws
-		Throwers[i]->SetRelativeRotation(FQuat(FVector::YAxisVector, FMath::Clamp(ThrowKicks[i] * 1.5f, 0.0f, 1.0f) * 1.25f + IdleSin(AnimTime * 1.7f + i * 1.9f) * 0.12f));
+		Throwers[i]->SetRelativeRotation(FQuat(FVector::YAxisVector, Throw * 1.25f - Cock + IdleSin(AnimTime * 1.7f + i * 1.9f) * 0.12f));
 	}
 	if (Type != ETDTowerType::Jelly)
 	{
@@ -1568,24 +1951,24 @@ void ATDTower::Tick(float DeltaTime)
 			FQuat Sway = FQuat::Identity;
 			switch (Type)
 			{
-			case ETDTowerType::Mantis:		// stalked eyes wander independently
-				Sway = FQuat(FVector::XAxisVector, IdleSin(AnimTime * 1.9f + i * 2.4f) * 0.3f) * FQuat(FVector::ZAxisVector, IdleSin(AnimTime * 1.3f + i * 4.0f) * 0.5f);
+			case ETDTowerType::Mantis:		// stalked eyes wander independently, and lock forward before a punch
+				Sway = FQuat(FVector::XAxisVector, IdleSin(AnimTime * 1.9f + i * 2.4f) * 0.3f * (1.0f - Windup)) * FQuat(FVector::ZAxisVector, IdleSin(AnimTime * 1.3f + i * 4.0f) * 0.5f * (1.0f - Windup));
 				break;
-			case ETDTowerType::Lionfish:	// fans held out to the sides, flaring on each shot
+			case ETDTowerType::Lionfish:	// fans held out to the sides, folding in before a shot and flaring on it
 				Sway = FQuat(FVector::XAxisVector, FMath::DegreesToRadians(Side * (-14.0f + IdleSin(AnimTime * 1.5f) * 5.0f)))
-					* FQuat(FVector::ZAxisVector, FMath::DegreesToRadians(Side * (-58.0f - FireKick * 16.0f + IdleSin(AnimTime * 1.5f + 1.0f) * 5.0f)));
+					* FQuat(FVector::ZAxisVector, FMath::DegreesToRadians(Side * (-58.0f - Kick * 16.0f + Windup * 12.0f + IdleSin(AnimTime * 1.5f + 1.0f) * 5.0f)));
 				break;
 			case ETDTowerType::Sawfish:
-				Sway = FQuat(FVector::XAxisVector, Side * IdleSin(AnimTime * 1.3f) * 0.12f);
+				Sway = FQuat(FVector::XAxisVector, Side * (IdleSin(AnimTime * 1.3f) * 0.12f + Kick * 0.1f));
 				break;
-			case ETDTowerType::Humpback:	// slow flipper strokes
-				Sway = FQuat(FVector::XAxisVector, Side * IdleSin(AnimTime * 1.4f) * 0.26f);
+			case ETDTowerType::Humpback:	// slow flipper strokes, a big one on each pulse
+				Sway = FQuat(FVector::XAxisVector, Side * (IdleSin(AnimTime * 1.4f) * 0.26f + Swell * 0.2f));
 				break;
 			case ETDTowerType::Octopus:	// sprawled arms shift a little
 				Sway = FQuat(FVector::XAxisVector, IdleSin(AnimTime * 1.6f + i * 1.1f) * 0.05f) * FQuat(FVector::YAxisVector, IdleCos(AnimTime * 1.3f + i) * 0.05f);
 				break;
-			case ETDTowerType::AcidVent:	// tube worm plumes in the current
-				Sway = FQuat(FVector::XAxisVector, IdleSin(AnimTime * 1.5f + i) * 0.22f) * FQuat(FVector::YAxisVector, IdleCos(AnimTime * 1.2f + i * 1.3f) * 0.22f);
+			case ETDTowerType::AcidVent:	// tube worm plumes in the current, ducking from each pulse
+				Sway = FQuat(FVector::XAxisVector, IdleSin(AnimTime * 1.5f + i) * 0.22f) * FQuat(FVector::YAxisVector, IdleCos(AnimTime * 1.2f + i * 1.3f) * 0.22f + Swell * 0.25f);
 				break;
 			default:
 				break;
@@ -1595,23 +1978,25 @@ void ATDTower::Tick(float DeltaTime)
 	}
 	for (USceneComponent* Club : Clubs)
 	{
-		// folded under the head, whipped out by a punch and eased back
-		const float Whip = FMath::Clamp(FireKick * 1.6f, 0.0f, 1.0f);
-		Club->SetRelativeRotation(FQuat(FVector::YAxisVector, FMath::DegreesToRadians(-118.0f + Whip * 128.0f)));
+		// folded under the head, cocked back before a punch, whipped out by it and eased back
+		const float Whip = FMath::Clamp(Kick * 1.05f, -0.15f, 1.0f);
+		Club->SetRelativeRotation(FQuat(FVector::YAxisVector, FMath::DegreesToRadians(-118.0f - Windup * 16.0f + Whip * 128.0f)));
 	}
 	if (Blade)
 	{
-		// the snout slashes side to side as a tooth flies off
-		Blade->SetRelativeRotation(FRotator(0, FMath::Sin(FireKick * 2.0f * PI) * 14.0f, 0));
+		// the snout draws back to one side, then slashes across as a tooth flies off
+		Blade->SetRelativeRotation(FRotator(0, Windup * 12.0f + FMath::Sin(FireKick * 2.0f * PI) * 16.0f, 0));
 	}
+	// smoke rises faster and fuller for a moment on each aura pulse
+	PuffClock += DeltaTime * (1.0f + 2.0f * Swell);
 	for (int32 i = 0; i < Puffs.Num(); ++i)
 	{
 		// smoke rises and swells from the chimney mouth, then thins away
-		const float U = FMath::Frac(AnimTime * 0.2f + (float)i / (i < VentMainPuffs ? VentMainPuffs : Puffs.Num() - VentMainPuffs));
+		const float U = FMath::Frac(PuffClock * 0.2f + (float)i / (i < VentMainPuffs ? VentMainPuffs : Puffs.Num() - VentMainPuffs));
 		const float Rise = i < VentMainPuffs ? 74.0f : 30.0f;
 		const float Wander = 2.0f + U * (i < VentMainPuffs ? 11.0f : 6.0f);
 		Puffs[i]->SetRelativeLocation(PuffBases[i] + FVector(IdleSin(AnimTime * 1.2f + i * 2.1f) * Wander + U * 5.0f, IdleCos(AnimTime * 0.9f + i * 1.7f) * Wander, U * Rise));
-		Puffs[i]->SetRelativeScale3D(FVector((0.55f + U * 1.5f) * FMath::Min(1.0f, U * 6.0f) * FMath::Min(1.0f, (1.0f - U) * 5.0f)));
+		Puffs[i]->SetRelativeScale3D(FVector((0.55f + U * 1.5f) * (1.0f + 0.15f * Swell) * FMath::Min(1.0f, U * 6.0f) * FMath::Min(1.0f, (1.0f - U) * 5.0f)));
 	}
 	if (!bGhost && IsSupportTower())
 	{
@@ -1629,24 +2014,12 @@ void ATDTower::Tick(float DeltaTime)
 		}
 	}
 
-	if (bGhost || !IsAttackTower())
+	if (!bAttacks)
 	{
 		return;
 	}
 
 	Cooldown -= DeltaTime;
-
-	ATDEnemy* Target = FindTarget(HitsFlying());
-
-	// turn the turret / head towards the target
-	if (Target && AnimPivot && Type != ETDTowerType::Jelly)
-	{
-		const FVector ToTarget = Target->GetActorLocation() - GetActorLocation();
-		const float DesiredYaw = ToTarget.Rotation().Yaw;
-		FRotator Rot = AnimPivot->GetRelativeRotation();
-		Rot.Yaw = FMath::FixedTurn(Rot.Yaw, DesiredYaw, 540.0f * DeltaTime);
-		AnimPivot->SetRelativeRotation(Rot);
-	}
 
 	if (!Target)
 	{

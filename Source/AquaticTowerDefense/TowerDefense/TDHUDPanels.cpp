@@ -151,14 +151,27 @@ void ATDHUD::DrawEnemyPanel(ATDGameMode* GameMode, ATDEnemy* Enemy)
 	{
 		const FString Label = TD::StatusName(Status);
 		const FVector2D Extent = MeasureText(Label, SizeSmall);
-		const FBox2D Chip(FVector2D(CX, CY), FVector2D(CX + Extent.X + 16.0f * S, CY + 26.0f * S));
+		const bool bGem = IsDetailedUI();
+		const float GemW = bGem ? 14.0f * S : 0.0f;
+		const FBox2D Chip(FVector2D(CX, CY), FVector2D(CX + Extent.X + 16.0f * S + GemW, CY + 26.0f * S));
 		if (Chip.Max.X > X + PanelW - Pad)
 		{
 			break;
 		}
 		RoundFill(Chip, WithAlpha(TD::StatusColor(Status) * 0.3f, 0.9f), Chip.GetSize().Y * 0.5f);
-		RoundFrame(Chip, WithAlpha(TD::StatusColor(Status), 0.8f), Chip.GetSize().Y * 0.5f, 1.0f * S);
-		Text(Label, Chip.GetCenter().X, Chip.GetCenter().Y, FLinearColor::White, SizeSmall, true, true);
+		if (bGem)
+		{
+			// a glass pill rimmed in the effect's colour, led by the same lit gem the creatures wear
+			DetailedCardEdge(Chip, TD::StatusColor(Status), Chip.GetSize().Y * 0.5f, 1.0f);
+			const FVector2D GemC(Chip.Min.X + 13.0f * S, Chip.GetCenter().Y);
+			RoundFill(FBox2D(GemC - FVector2D(5.5f * S), GemC + FVector2D(5.5f * S)), FLinearColor(0, 0, 0, 0.6f), 5.5f * S);
+			Pearl(GemC, 4.5f * S, TD::StatusColor(Status));
+		}
+		else
+		{
+			RoundFrame(Chip, WithAlpha(TD::StatusColor(Status), 0.8f), Chip.GetSize().Y * 0.5f, 1.0f * S);
+		}
+		Text(Label, Chip.GetCenter().X + GemW * 0.5f, Chip.GetCenter().Y, FLinearColor::White, SizeSmall, true, true);
 		if (Chip.IsInside(MousePos))
 		{
 			const float Time = Enemy->GetStatusTime(Status);
@@ -202,6 +215,10 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 	const TCHAR* Tag = Next % 10 == 0 ? TEXT("BOSS") : (ATDGameMode::IsMiniBossWave(Next) ? TEXT("MINI-BOSS") : (ATDGameMode::IsMixedWave(Next) ? TEXT("MIXED") : TEXT("")));
 	const FString TagText = Tag;
 
+	// fast / shielded odds for each regular creature of the wave (bosses and the elite never roll them)
+	const float ModChance = TD::ModifierChance(Next);
+	const FString ModText = ModChance > 0.0f ? FString::Printf(TEXT("FAST / SHIELD %d%%"), FMath::RoundToInt(ModChance * 100.0f)) : FString();
+
 	// one creature group: tinted icon well and count, with details on hover
 	auto Entry = [this, &Groups, Next, HealthMul, S](int32 i, const FBox2D& Rect, float IconW)
 	{
@@ -240,15 +257,29 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 		// icon 6 in from the left edge, count 8 in from the right
 		return 6.0f * S + IconW + 4.0f * S + MeasureText(FString::Printf(TEXT("x%d"), Groups[i].Value), SizeField).X + 8.0f * S;
 	};
-	auto TagPill = [this, &TagText, S](float X, float CY)
+	auto Pill = [this, S](const FString& PillText, const FLinearColor& Color, float X, float CY)
 	{
-		const FVector2D Extent = MeasureText(TagText, SizeCaption);
-		const FBox2D Pill(FVector2D(X, CY - Extent.Y * 0.5f - 3.0f * S), FVector2D(X + Extent.X + 14.0f * S, CY + Extent.Y * 0.5f + 3.0f * S));
-		RoundFill(Pill, WithAlpha(VioletColor * 0.25f, 0.9f), 6.0f * S);
-		RoundFrame(Pill, WithAlpha(VioletColor, 0.6f), 6.0f * S, 1.0f * S);
-		Text(TagText, Pill.GetCenter().X, Pill.GetCenter().Y, VioletColor, SizeCaption, true, true);
-		return Pill.GetSize().X;
+		const FVector2D Extent = MeasureText(PillText, SizeCaption);
+		const FBox2D Box(FVector2D(X, CY - Extent.Y * 0.5f - 3.0f * S), FVector2D(X + Extent.X + 14.0f * S, CY + Extent.Y * 0.5f + 3.0f * S));
+		RoundFill(Box, WithAlpha(Color * 0.25f, 0.9f), 6.0f * S);
+		RoundFrame(Box, WithAlpha(Color, 0.6f), 6.0f * S, 1.0f * S);
+		Text(PillText, Box.GetCenter().X, Box.GetCenter().Y, Color, SizeCaption, true, true);
+		return Box;
 	};
+	auto TagPill = [&Pill, &TagText](float X, float CY) { return Pill(TagText, VioletColor, X, CY).GetSize().X; };
+	// the fast / shielded odds, with what they mean on hover
+	auto ModPill = [this, &Pill, &ModText, ModChance](float X, float CY)
+	{
+		const FBox2D Box = Pill(ModText, StatRate, X, CY);
+		if (Box.IsInside(MousePos))
+		{
+			const int32 Pct = FMath::RoundToInt(ModChance * 100.0f);
+			SetTip({ { TEXT("Fast and shielded"), StatRate },
+				{ FString::Printf(TEXT("Each creature: %d%% fast, %d%% shielded"), Pct, Pct), FLinearColor::White } });
+		}
+		return Box.GetSize().X;
+	};
+	auto PillWidth = [this, S](const FString& PillText) { return PillText.IsEmpty() ? 0.0f : 10.0f * S + MeasureText(PillText, SizeCaption).X + 14.0f * S; };
 
 	// ---- preferred: a slim card in the top row, between the two top clusters ----
 	{
@@ -266,10 +297,7 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 		{
 			RowW += EntryGap + EntryWidth(i, IconW);
 		}
-		if (!TagText.IsEmpty())
-		{
-			RowW += 10.0f * S + MeasureText(TagText, SizeCaption).X + 14.0f * S;
-		}
+		RowW += PillWidth(TagText);
 
 		const float Left = TopLeftRect.bIsValid ? TopLeftRect.Max.X + 12.0f * S : 14.0f * S;
 		const float Right = TopRightRect.bIsValid ? TopRightRect.Min.X - 12.0f * S : Canvas->ClipX - 14.0f * S;
@@ -291,7 +319,14 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 			}
 			if (!TagText.IsEmpty())
 			{
-				TagPill(EX + 10.0f * S, MidY);
+				EX += 10.0f * S + TagPill(EX + 10.0f * S, MidY);
+			}
+			// the odds hang just under the card, where they never crowd the top row
+			if (!ModText.IsEmpty())
+			{
+				const float PillH = MeasureText(ModText, SizeCaption).Y + 6.0f * S;
+				ModPill(X + Inner, Rect.Max.Y + 4.0f * S + PillH * 0.5f);
+				PreviewPillBottom = Rect.Max.Y + 4.0f * S + PillH;
 			}
 			return;
 		}
@@ -305,7 +340,7 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 	const int32 PerRow = 4;
 	const int32 Rows = FMath::DivideAndRoundUp(Groups.Num(), PerRow);
 	const FString Title = FString::Printf(TEXT("Next: wave %d"), Next);
-	const float TitleW = MeasureText(Title, SizeBody).X + (TagText.IsEmpty() ? 0.0f : 10.0f * S + MeasureText(TagText, SizeCaption).X + 14.0f * S);
+	const float TitleW = MeasureText(Title, SizeBody).X + PillWidth(TagText) + PillWidth(ModText);
 	// only as wide as this wave needs
 	const float W = Pad * 2.0f + FMath::Max(FMath::Min(Groups.Num(), PerRow) * EntryW - 6.0f * S, TitleW);
 	const float H = Pad * 2.0f + 28.0f * S + Rows * (EntryH + 6.0f * S) - 6.0f * S;
@@ -322,9 +357,14 @@ void ATDHUD::DrawWavePreview(ATDGameMode* GameMode)
 	FramedPanel(Rect, PanelEdge);
 	const float TitleY = Y + Pad + 10.0f * S;
 	const float TW = Text(Title, X + Pad, TitleY, AccentColor, SizeBody, false, true).X;
+	float PillX = X + Pad + TW;
 	if (!TagText.IsEmpty())
 	{
-		TagPill(X + Pad + TW + 10.0f * S, TitleY);
+		PillX += 10.0f * S + TagPill(PillX + 10.0f * S, TitleY);
+	}
+	if (!ModText.IsEmpty())
+	{
+		ModPill(PillX + 10.0f * S, TitleY);
 	}
 
 	for (int32 i = 0; i < Groups.Num(); ++i)

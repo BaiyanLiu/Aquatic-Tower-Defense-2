@@ -7,6 +7,8 @@
 #include "TDRules.h"
 #include "TDRun.h"
 #include "TDModels.h"
+#include "TDBoardSurface.h"
+#include "AquaticTowerDefense.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -218,6 +220,104 @@ namespace
 		}
 		return Parts;
 	}
+
+	/** A seafloor piece: its sculpted mesh baked under Content/ATDModels (one connected surface) when there is one, else its shapes */
+	const FTDMergedMesh& DecorMesh(const TCHAR* BakedName, uint64 Key, TFunctionRef<TArray<FTDMergedPart>()> MakeParts)
+	{
+		if (const FTDMergedMesh* Baked = TD::GetBakedPropMesh(BakedName))
+		{
+			return *Baked;
+		}
+		return TD::GetDetailedMergedMesh(Key, MakeParts());
+	}
+
+	/** Baked file of each decor kind; the variant number follows it */
+	const TCHAR* const DecorFiles[(int32)EDecor::Count] = { TEXT("DecorRocks"), TEXT("DecorCoral"), TEXT("DecorBrainCoral"), TEXT("DecorShell"), TEXT("DecorStarfish"), TEXT("DecorAnemone") };
+
+	/** The detailed look's painted board of one map and Abyss tier: sand tiles, the stone slab under a full board and the seafloor patch */
+	struct FPainted
+	{
+		UStaticMesh* Tiles = nullptr;
+		UStaticMesh* Slab = nullptr;
+		UStaticMesh* Floor = nullptr;
+	};
+
+	TMap<int32, FPainted>& PaintedCache()
+	{
+		static TMap<int32, FPainted> Cache;
+		return Cache;
+	}
+
+	int32 PaintKey(int32 Map, int32 Tier)
+	{
+		return Map * 1000 + Tier;
+	}
+
+	/** Whether the current map uses every cell of the grid (one slab under it all) */
+	bool IsFullBoard()
+	{
+		for (int32 Y = 0; Y < TD::Rows; ++Y)
+		{
+			for (int32 X = 0; X < TD::Cols; ++X)
+			{
+				if (!TD::IsOnBoard(FIntPoint(X, Y)))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	/** The jobs that paint the current map's board at Tier into PaintedCache (the map must stay the same until they finish) */
+	void AddPaintedJobs(int32 Tier, TArray<FTDSurfaceJob>& Out)
+	{
+		const int32 Map = TD::GetMap();
+		const int32 Key = PaintKey(Map, Tier);
+		PaintedCache().FindOrAdd(Key);
+		// (Abyss tiers deepen the seabed towards blue-violet)
+		const TDBoardSurface::FStyle Style = TDBoardSurface::StyleFor(Map, TD::MapTint(Map) * TD::AbyssTint(Tier));
+
+		FTDSurfaceJob& Tiles = Out.AddDefaulted_GetRef();
+		Tiles.Build = [Style](FTDSculptMesh& Mesh)
+		{
+			TDBoardSurface::BuildTiles(Style, [](const FIntPoint& Cell) { return TD::IsOnBoard(Cell); }, [](const FIntPoint& Cell) { return TD::CellToWorld(Cell, 0.0f); },
+				TD::Cols, TD::Rows, Mesh);
+		};
+		Tiles.Look = ETDSurface::Sand;
+		Tiles.OnBuilt = [Key](UStaticMesh* Mesh) { PaintedCache().FindOrAdd(Key).Tiles = Mesh; };
+
+		FTDSurfaceJob& Floor = Out.AddDefaulted_GetRef();
+		Floor.Build = [Style](FTDSculptMesh& Mesh) { TDBoardSurface::BuildFloor(Style, 4200.0f, -84.2f, Mesh); };
+		Floor.Look = ETDSurface::Sand;
+		Floor.OnBuilt = [Key](UStaticMesh* Mesh) { PaintedCache().FindOrAdd(Key).Floor = Mesh; };
+
+		// a shaped map gets a plain slab piece per cell instead
+		if (IsFullBoard())
+		{
+			const FVector2D Size(TD::Rows * TD::TileSize + 70, TD::Cols * TD::TileSize + 70);
+			FTDSurfaceJob& Slab = Out.AddDefaulted_GetRef();
+			Slab.Build = [Style, Size](FTDSculptMesh& Mesh) { TDBoardSurface::BuildSlab(Style, Size, -5.0f, 80.0f, Mesh); };
+			Slab.Look = ETDSurface::Stone;
+			Slab.OnBuilt = [Key](UStaticMesh* Mesh) { PaintedCache().FindOrAdd(Key).Slab = Mesh; };
+		}
+	}
+}
+
+void ATDGrid::AddPrewarmWork(FTDPrewarmExtras& Extras)
+{
+	for (int32 Kind = 0; Kind < (int32)EDecor::Count; ++Kind)
+	{
+		for (int32 Variant = 0; Variant < DecorVariants; ++Variant)
+		{
+			Extras.BakedProps.Add(FString::Printf(TEXT("%s%d"), DecorFiles[Kind], Variant));
+		}
+	}
+	Extras.BakedProps.Append({ TEXT("DecorVent"), TEXT("DecorFish"), TEXT("DecorManta") });
+	if (TD::UseDetailedModels() && !PaintedCache().Contains(PaintKey(TD::GetMap(), TD::Run().Tier)))
+	{
+		AddPaintedJobs(TD::Run().Tier, Extras.Surfaces);
+	}
 }
 
 ATDGrid::ATDGrid()
@@ -253,6 +353,9 @@ void ATDGrid::BuildMapVisuals()
 	}
 	BuiltMap = TD::GetMap();
 	BuiltTier = TD::Run().Tier;
+	const double BuildStart = FPlatformTime::Seconds();
+	// this map's tower platform, and the Coral Walls sculpted in the background, so the first ones built don't hitch
+	ATDTower::PrewarmBoardMeshes();
 
 	// clear the previous map's pieces
 	if (MapRoot)
@@ -279,6 +382,7 @@ void ATDGrid::BuildMapVisuals()
 	SnowISM = nullptr;
 	FishISM = nullptr;
 	BubbleISM = nullptr;
+	BubbleGlintISM = nullptr;
 	Manta = nullptr;
 	MapRoot = TD::AddPivot(this, GetRootComponent(), FVector::ZeroVector);
 	USceneComponent* Root = MapRoot;
@@ -301,6 +405,35 @@ void ATDGrid::BuildMapVisuals()
 		// open seafloor around the board
 		TD::AddShape(this, Root, ETDShape::Cube, FVector(0, 0, -95), FVector(9000, 9000, 20), Tinted(FLinearColor(0.035f, 0.11f, 0.12f)));
 
+		// the detailed look paints the board: sand tiles with ripples, pebbles and shell bits, a layered stone slab and a mottled
+		// patch of seafloor, each one vertex-coloured mesh (made once per map and tier, on all cores; the startup prewarm makes the first)
+		FPainted* Painted = nullptr;
+		if (TD::UseDetailedModels())
+		{
+			const int32 Key = PaintKey(BuiltMap, BuiltTier);
+			if (!PaintedCache().Contains(Key))
+			{
+				TArray<FTDSurfaceJob> Jobs;
+				AddPaintedJobs(BuiltTier, Jobs);
+				TD::MakeSurfaceMeshes(MoveTemp(Jobs));
+			}
+			Painted = PaintedCache().Find(Key);
+			if (Painted && !Painted->Tiles)
+			{
+				Painted = nullptr;	// no detail material: the plain tiles below
+			}
+		}
+		auto AddPainted = [this, Root](UStaticMesh* Mesh)
+		{
+			FTDMergedMesh Merged;
+			Merged.Mesh = Mesh;
+			TD::AddMergedMesh(this, Root, Merged, false);
+		};
+		if (Painted && Painted->Floor)
+		{
+			AddPainted(Painted->Floor);
+		}
+
 		// darker slab under the board: one piece for a full rectangle, otherwise one per cell so it follows the outline
 		const FLinearColor SlabColor = Tinted(FLinearColor(0.05f, 0.09f, 0.1f));
 		bool bFullBoard = true;
@@ -313,7 +446,18 @@ void ATDGrid::BuildMapVisuals()
 		}
 		if (bFullBoard)
 		{
-			TD::AddShape(this, Root, ETDShape::Cube, FVector(0, 0, -45), FVector(BoardW + 70, BoardH + 70, 80), SlabColor);
+			if (Painted && Painted->Slab)
+			{
+				AddPainted(Painted->Slab);
+			}
+			else
+			{
+				TD::AddShape(this, Root, ETDShape::Cube, FVector(0, 0, -45), FVector(BoardW + 70, BoardH + 70, 80), SlabColor);
+			}
+		}
+		if (Painted && Painted->Tiles)
+		{
+			AddPainted(Painted->Tiles);
 		}
 
 		// seabed tiles in slightly varying sand colors
@@ -332,6 +476,10 @@ void ATDGrid::BuildMapVisuals()
 				if (!bFullBoard)
 				{
 					TD::AddShape(this, Root, ETDShape::Cube, TD::CellToWorld(Cell, -45.0f), FVector(170, 170, 80), SlabColor);
+				}
+				if (Painted && Painted->Tiles)
+				{
+					continue;	// the painted tiles cover it
 				}
 				const FLinearColor Sand(0.2f + Noise + Checker, 0.3f + Noise + Checker, 0.27f + Noise * 0.5f);
 				TD::AddShape(this, Root, ETDShape::Cube, TD::CellToWorld(Cell, -6.0f), FVector(97, 97, 12), Tinted(Sand));
@@ -511,7 +659,7 @@ void ATDGrid::BuildMapVisuals()
 			}
 			USceneComponent* VentPivot = TD::AddPivot(this, Root, P);
 			VentPivot->SetRelativeRotation(FRotator(0, DecorRand.FRandRange(0, 360), 0));
-			TD::AddMergedMesh(this, VentPivot, TD::GetDetailedMergedMesh(DecorKeyBase + 100, Parts), true);
+			TD::AddMergedMesh(this, VentPivot, DecorMesh(TEXT("DecorVent"), DecorKeyBase + 100, [&Parts]() { return Parts; }), true);
 		}
 
 		// rocks and coral most often, the flat pieces and anemones scattered between
@@ -552,7 +700,8 @@ void ATDGrid::BuildMapVisuals()
 			Pivot->SetRelativeScale3D(FVector(Scale));
 			const uint64 Key = DecorKeyBase + (uint64)Kind * 8 + Variant;
 			const bool bShadows = Kind != EDecor::Shell && Kind != EDecor::Starfish;
-			TD::AddMergedMesh(this, Pivot, TD::GetDetailedMergedMesh(Key, MakeDecorParts(Kind, Variant)), bShadows);
+			const FString BakedName = FString::Printf(TEXT("%s%d"), DecorFiles[(int32)Kind], Variant);
+			TD::AddMergedMesh(this, Pivot, DecorMesh(*BakedName, Key, [Kind, Variant]() { return MakeDecorParts(Kind, Variant); }), bShadows);
 			if (Kind == EDecor::Anemone)
 			{
 				Anemones.Add(Pivot);
@@ -561,6 +710,7 @@ void ATDGrid::BuildMapVisuals()
 
 		BuildAmbience(Root, ClearOfBoard, Vents);
 	}
+	UE_LOG(LogAquaticTowerDefense, Log, TEXT("Built the map's seabed in %.0f ms"), (FPlatformTime::Seconds() - BuildStart) * 1000.0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -712,10 +862,14 @@ void ATDGrid::BuildAmbience(USceneComponent* Root, const TFunctionRef<bool(const
 		const float Top = FMath::Clamp(MaxAmbientZ(Vent), FloorZ + 120.0f, 320.0f);
 		for (int32 i = 0; i < 12; ++i)
 		{
-			VentBubbles.Add({ Vent + FVector(0, 0, 9.0f), (float)R.FRandRange(22.0f, 34.0f), (float)(Top - (Vent.Z + 9.0f)), (float)((i + R.FRand() * 0.5f) / 12.0f), (float)R.FRandRange(2.5f, 5.5f) });
+			VentBubbles.Add({ Vent + FVector(0, 0, 13.0f), (float)R.FRandRange(22.0f, 34.0f), (float)(Top - (Vent.Z + 13.0f)), (float)((i + R.FRand() * 0.5f) / 12.0f), (float)R.FRandRange(2.5f, 5.5f) });
 		}
 	}
 	BubbleISM = MakeInstanced(TD::UnitShapeMesh(ETDShape::Sphere, 6.0f), TD::SharedFxMaterial(FLinearColor(0.7f, 0.95f, 1.0f), 0.38f));
+	if (TD::UseDetailedModels())
+	{
+		BubbleGlintISM = MakeInstanced(TD::UnitShapeMesh(ETDShape::Sphere, 4.0f), TD::SharedFxMaterial(FLinearColor(1.0f, 1.0f, 1.0f), 0.85f));
+	}
 
 	// ---- small schools of dark fish circling far round the board ----
 	{
@@ -732,7 +886,7 @@ void ATDGrid::BuildAmbience(USceneComponent* Root, const TFunctionRef<bool(const
 		Part(ETDShape::Sphere, FVector(0, 0, 0), FVector(18.0f, 6.0f, 7.0f), Body);
 		Part(ETDShape::Sphere, FVector(-11.0f, 0, 0), FVector(7.0f, 1.5f, 8.0f), Body);
 		Part(ETDShape::Sphere, FVector(1.0f, 0, 3.5f), FVector(6.0f, 1.2f, 3.0f), Body);
-		const FTDMergedMesh& FishMesh = TD::GetDetailedMergedMesh(DecorKeyBase + 101, Parts);
+		const FTDMergedMesh& FishMesh = DecorMesh(TEXT("DecorFish"), DecorKeyBase + 101, [&Parts]() { return Parts; });
 		FishISM = MakeInstanced(FishMesh.Mesh, nullptr);
 		for (int32 s = 0; s < 3; ++s)
 		{
@@ -765,7 +919,7 @@ void ATDGrid::BuildAmbience(USceneComponent* Root, const TFunctionRef<bool(const
 		Part(ETDShape::Cylinder, FVector(-100.0f, 0, 0), FVector(2.5f, 2.5f, 110.0f), FQuat(FVector::RightVector, PI * 0.5f));
 		Manta = TD::AddPivot(this, Root, FVector::ZeroVector);
 		Manta->SetRelativeScale3D(FVector(1.6f));
-		TD::AddMergedMesh(this, Manta, TD::GetDetailedMergedMesh(DecorKeyBase + 102, Parts), false);
+		TD::AddMergedMesh(this, Manta, DecorMesh(TEXT("DecorManta"), DecorKeyBase + 102, [&Parts]() { return Parts; }), false);
 		MantaX = HalfX + 520.0f;
 		MantaSpan = HalfY + 1500.0f;
 	}
@@ -792,12 +946,18 @@ void ATDGrid::TickAmbience()
 	{
 		const float A = T * (0.12f + 0.03f * (i % 3)) + i * 1.7f;
 		const FVector Offset(FMath::Cos(A) * 28.0f, FMath::Sin(A * 0.8f) * 28.0f, 0.0f);
+		// the rings share one pivot: move it once per patch (moving it per ring moved every ring five times a frame)
+		bool bPivotMoved = false;
 		for (int32 Ring = 0; Ring < CausticRings; ++Ring)
 		{
 			if (UStaticMeshComponent* Disc = Caustics.IsValidIndex(i * CausticRings + Ring) ? Caustics[i * CausticRings + Ring].Get() : nullptr)
 			{
+				if (!bPivotMoved)
+				{
+					Disc->GetAttachParent()->SetRelativeLocation(CausticBase[i] + Offset * 0.5f);
+					bPivotMoved = true;
+				}
 				// inner rings wander a little further, so the patch's shape keeps changing
-				Disc->GetAttachParent()->SetRelativeLocation(CausticBase[i] + Offset * 0.5f);
 				Disc->SetRelativeLocation(FVector(Offset.X * 0.15f * Ring, Offset.Y * 0.15f * Ring, Ring * 0.2f));
 			}
 		}
@@ -835,6 +995,26 @@ void ATDGrid::TickAmbience()
 	};
 	Drift(SnowISM, Snow, false, 14.0f, 0.12f);
 	Drift(BubbleISM, VentBubbles, true, 5.0f, 1.3f);
+	if (BubbleGlintISM && BubbleISM)
+	{
+		// each bubble's catch light sits high on its sunlit side
+		for (FTransform& Xf : AmbientScratch)
+		{
+			const float Size = (float)Xf.GetScale3D().X * 100.0f;
+			Xf.SetLocation(Xf.GetLocation() + FVector(-0.22f, -0.22f, 0.3f) * Size);
+			Xf.SetScale3D(FVector(Size * 0.22f / 100.0f));
+		}
+		if (BubbleGlintISM->GetInstanceCount() != AmbientScratch.Num())
+		{
+			BubbleGlintISM->ClearInstances();
+			BubbleGlintISM->AddInstances(AmbientScratch, false, false, false);
+		}
+		else
+		{
+			BubbleGlintISM->BatchUpdateInstancesTransforms(0, AmbientScratch, false, false, true);
+		}
+		BubbleGlintISM->UpdateBounds();
+	}
 
 	// fish: each school swims round its ellipse, every fish holding its place in the school with a little wiggle
 	if (FishISM)
@@ -945,7 +1125,9 @@ ATDGrid::FRangeIndicator& ATDGrid::GetIndicator(int32 Index)
 		FRangeIndicator& New = Indicators.AddDefaulted_GetRef();
 
 		New.Ring = NewObject<UInstancedStaticMeshComponent>(this);
-		New.Ring->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")));
+		// the detailed look: rounded beads that overlap into a smooth, softly lit band instead of flat boxes
+		bRoundRings = TD::UseDetailedModels();
+		New.Ring->SetStaticMesh(bRoundRings ? TD::UnitShapeMesh(ETDShape::Sphere, 12.0f) : LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")));
 		New.Ring->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		New.Ring->SetCastShadow(false);
 		// solid (lit) ring reads best over the seabed; the disc and tile tint stay see-through
@@ -994,7 +1176,7 @@ void ATDGrid::SetRangeViews(const TArray<FTDRangeView>& Views)
 
 			TArray<FTransform> Segments;
 			Segments.Reserve(RingSegments);
-			const float SegmentLength = 2.0f * PI * Radius / RingSegments * 1.08f;
+			const float SegmentLength = 2.0f * PI * Radius / RingSegments * (bRoundRings ? 1.9f : 1.08f);
 			for (int32 Seg = 0; Seg < RingSegments; ++Seg)
 			{
 				const float Angle = 2.0f * PI * Seg / RingSegments;
@@ -1378,7 +1560,8 @@ void ATDGrid::RebuildField()
 UInstancedStaticMeshComponent* ATDGrid::MakeRouteMarkers(UMaterialInterface* Material)
 {
 	UInstancedStaticMeshComponent* Markers = NewObject<UInstancedStaticMeshComponent>(this);
-	Markers->SetStaticMesh(TD::UnitShapeMesh(ETDShape::Cylinder, 24.0f));
+	// the detailed look shows each marker as a small domed pebble; the original a flat disc
+	Markers->SetStaticMesh(TD::UnitShapeMesh(TD::UseDetailedModels() ? ETDShape::Sphere : ETDShape::Cylinder, 24.0f));
 	Markers->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	Markers->SetCastShadow(false);
 	Markers->SetMaterial(0, Material);
@@ -1390,7 +1573,7 @@ UInstancedStaticMeshComponent* ATDGrid::MakeRouteMarkers(UMaterialInterface* Mat
 
 void ATDGrid::LayoutRouteMarkers(const TArray<FIntPoint>& InRoute, UInstancedStaticMeshComponent* Markers, float Z, float Size)
 {
-	const FVector Scale(Size / 100.0f, Size / 100.0f, 0.02f);
+	const FVector Scale(Size / 100.0f, Size / 100.0f, TD::UseDetailedModels() ? Size * 0.4f / 100.0f : 0.02f);
 	TArray<FTransform> Dots;
 	Dots.Reserve(InRoute.Num() * 2);
 	for (int32 i = 0; i < InRoute.Num(); ++i)

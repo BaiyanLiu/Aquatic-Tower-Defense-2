@@ -51,6 +51,13 @@ protected:
 	UPROPERTY()
 	TObjectPtr<UInstancedStaticMeshComponent> Bubbles;
 
+	/** The detailed look (atd.DetailedModels): white glints trailing a ring, sparks flying from a splash */
+	UPROPERTY()
+	TObjectPtr<UInstancedStaticMeshComponent> Glints;
+
+	/** Each burst or bolt piece's own width (scale), so the flicker keeps a bolt's bright core thinner than its glow */
+	TArray<float> PartWidths;
+
 	/** Burst and bolt pieces */
 	UPROPERTY()
 	TArray<TObjectPtr<UStaticMeshComponent>> Parts;

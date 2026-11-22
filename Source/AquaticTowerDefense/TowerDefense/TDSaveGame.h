@@ -238,6 +238,14 @@ public:
 	UPROPERTY()
 	bool bSharpAA = false;
 
+	/** Hand-drawn HD icons (off: the detailed icons) */
+	UPROPERTY()
+	bool bHDIcons = true;
+
+	/** The detailed interface: nacre rims, glass controls, painted decorations and backdrop (off: the plain shapes) */
+	UPROPERTY()
+	bool bHDInterface = true;
+
 	/** Effects and music volume in percent, 0-100 */
 	UPROPERTY()
 	float SfxVolume = 100.0f;

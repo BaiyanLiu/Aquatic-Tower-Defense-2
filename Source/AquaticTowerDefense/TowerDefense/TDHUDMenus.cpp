@@ -256,7 +256,7 @@ void ATDHUD::DrawMenu(ATDGameMode* GameMode)
 	{
 	case ETDMenu::Main:		ContentH = 76.0f + 406.0f + 62.0f + 40.0f + 26.0f * TD::MapCount; break;	// 76: the logo above the title; 62: the Mastery button
 	case ETDMenu::Pause:	ContentH = 520.0f + 44.0f - 26.0f + 30.0f; break;	// +44: the brand above "PAUSED"; -26: no resume hint under it; +30: the score line
-	case ETDMenu::Settings:	ContentH = 764.0f; break;	// (auto-salvage moved to the storage panel, the all-ranges switch and the Alt note are gone)
+	case ETDMenu::Settings:	ContentH = 818.0f; break;	// +54: the HD art switches (auto-salvage moved to the storage panel, the all-ranges switch and the Alt note are gone)
 	case ETDMenu::Controls:	ContentH = 30.0f + 96.0f + 30.0f + 50.0f * FMath::Max(TDBind::ActionCount + 3, (int32)ETDTowerType::Count) + 20.0f + 50.0f + 30.0f; break;	// two columns: actions, Info and the fixed mouse rows; tower keys
 	case ETDMenu::Victory:	ContentH = 30.0f + 196.0f + RunSummaryHeight + 4.0f * 62.0f + 18.0f; break;
 	default: break;
@@ -508,6 +508,23 @@ void ATDHUD::DrawMenu(ATDGameMode* GameMode)
 			};
 			Toggle(FBox2D(FVector2D(Left, Y), FVector2D(Left + ToggleW, Y + ToggleH)), TEXT("Show FPS"), EButton::ToggleShowFps, bFps);
 			Toggle(FBox2D(FVector2D(Left + ToggleW + Gap, Y), FVector2D(Right, Y + ToggleH)), TEXT("VSync"), EButton::ToggleVSync, bVSync);
+			Y += ToggleH + 12.0f * S;
+
+			// the HD art: icons and interface each on their own switch
+			const FBox2D IconsRect(FVector2D(Left, Y), FVector2D(Left + ToggleW, Y + ToggleH));
+			const FBox2D InterfaceRect(FVector2D(Left + ToggleW + Gap, Y), FVector2D(Right, Y + ToggleH));
+			Toggle(IconsRect, TEXT("HD icons"), EButton::ToggleHDIcons, GameMode->IsHDIcons());
+			Toggle(InterfaceRect, TEXT("HD interface"), EButton::ToggleHDInterface, GameMode->IsHDInterface());
+			if (IconsRect.IsInside(MousePos))
+			{
+				SetTip({ { TEXT("HD icons"), AccentColor }, { TEXT("On: hand-drawn icons for towers, creatures, skills, items and boons"), FLinearColor::White },
+					{ TEXT("Off: the simpler detailed icons"), FLinearColor::White }, { TEXT("Switching paints every icon once, which takes a few seconds the first time"), DimText } });
+			}
+			if (InterfaceRect.IsInside(MousePos))
+			{
+				SetTip({ { TEXT("HD interface"), AccentColor }, { TEXT("On: nacre panel rims, glass buttons and bars, painted decorations and backdrop"), FLinearColor::White },
+					{ TEXT("Off: the plain panels and controls"), FLinearColor::White } });
+			}
 			Y += ToggleH + 12.0f * S;
 
 			// anti-aliasing and the controls share the last row
