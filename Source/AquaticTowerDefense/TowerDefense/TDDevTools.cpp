@@ -92,6 +92,12 @@ void ATDPlayerController::ATDSelect(int32 X, int32 Y)
 	{
 		SelectPlacedTower(Tower);
 	}
+	else
+	{
+		// no tower there: clear the selection and close storage (a clean board for screenshots)
+		ClearSelection();
+		bStorageOpen = false;
+	}
 #endif
 }
 
